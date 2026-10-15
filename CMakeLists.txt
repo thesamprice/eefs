@@ -54,6 +54,32 @@ else()
 endif()
 set(EEFS_MACROS_DIR "${_eefs_default_macros_dir}" CACHE PATH "Directory containing eefs_macros.h")
 
+# Library lock (EEFS_LIB_LOCK / EEFS_LIB_UNLOCK of the standalone eefs_macros.h).  none: empty macros, for one task
+# (the default, unchanged).  hooks: the macros call EEFS_LibLockHook() / EEFS_LibUnlockHook(), which the application
+# provides.  rtems: the same hooks, implemented by EEFS (drivers/standalone_driver/eefs_rtems_lock.c) with a statically
+# initialized RTEMS recursive mutex that uses priority inheritance; RTEMS targets only.  Several tasks that use the
+# library (for example a background NAND health check next to writer tasks) need hooks or rtems.
+set(EEFS_LOCK "none" CACHE STRING "EEFS library lock: none, hooks or rtems")
+set_property(CACHE EEFS_LOCK PROPERTY STRINGS none hooks rtems)
+if(NOT EEFS_LOCK MATCHES "^(none|hooks|rtems)$")
+    message(FATAL_ERROR "Unknown EEFS_LOCK '${EEFS_LOCK}' (expected none, hooks or rtems)")
+endif()
+if(NOT EEFS_LOCK STREQUAL "none")
+    if(NOT EEFS_DRIVER STREQUAL "standalone")
+        message(FATAL_ERROR "EEFS_LOCK=${EEFS_LOCK} needs EEFS_DRIVER=standalone (the ${EEFS_DRIVER} driver's "
+            "eefs_macros.h has its own lock)")
+    endif()
+    if(NOT EEFS_MACROS_DIR STREQUAL "${PROJECT_SOURCE_DIR}/drivers/standalone_driver")
+        message(WARNING "EEFS_LOCK=${EEFS_LOCK} with a custom EEFS_MACROS_DIR: its eefs_macros.h must route "
+            "EEFS_LIB_LOCK/EEFS_LIB_UNLOCK to EEFS_LibLockHook()/EEFS_LibUnlockHook() when EEFS_LIB_LOCK_HOOKS is "
+            "defined, as drivers/standalone_driver/eefs_macros.h does")
+    endif()
+endif()
+if(EEFS_LOCK STREQUAL "rtems" AND NOT RTEMS_BSP)
+    message(FATAL_ERROR "EEFS_LOCK=rtems needs an RTEMS target (configure with "
+        "-DCMAKE_TOOLCHAIN_FILE=cmake/rtems-toolchain.cmake); use EEFS_LOCK=hooks to supply your own lock")
+endif()
+
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(EEFS_WARNING_FLAGS -Wall -W -Wstrict-prototypes -Wundef)
 endif()
@@ -111,15 +137,30 @@ else()
     set(_eefs_core_sources libraries/eepromfs/eefs_fileapi.c)
 endif()
 
+# The EEFS-provided RTEMS lock (EEFS_LOCK=rtems); also compiled into the RTEMS NAND test's locked library
+set(EEFS_RTEMS_LOCK_SOURCES drivers/standalone_driver/eefs_rtems_lock.c)
+if(EEFS_LOCK STREQUAL "rtems")
+    set(_eefs_lock_sources ${EEFS_RTEMS_LOCK_SOURCES})
+else()
+    set(_eefs_lock_sources "")
+endif()
+
 add_library(eefs STATIC
     ${_eefs_core_sources}
-    ${EEFS_DRIVER_SOURCES_${EEFS_DRIVER}})
+    ${EEFS_DRIVER_SOURCES_${EEFS_DRIVER}}
+    ${_eefs_lock_sources})
 add_library(eefs::eefs ALIAS eefs)
 target_link_libraries(eefs PUBLIC eefs_headers)
 target_include_directories(eefs PUBLIC
     $<BUILD_INTERFACE:${EEFS_MACROS_DIR}>
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/drivers/${EEFS_DRIVER}_driver>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/eefs>)
+# PUBLIC, so that every consumer of eefs_macros.h sees the same lock macros
+if(EEFS_LOCK STREQUAL "hooks")
+    target_compile_definitions(eefs PUBLIC EEFS_LIB_LOCK_HOOKS)
+elseif(EEFS_LOCK STREQUAL "rtems")
+    target_compile_definitions(eefs PUBLIC EEFS_LIB_LOCK_HOOKS EEFS_LIB_LOCK_RTEMS)
+endif()
 target_compile_options(eefs PRIVATE ${EEFS_WARNING_FLAGS})
 set_target_properties(eefs PROPERTIES C_STANDARD 90 C_EXTENSIONS OFF)
 
@@ -202,6 +243,9 @@ else()
             inc/eefs_eeprom_types.h
             libraries/microeefs/microeefs.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
+endif()
+if(EEFS_LOCK STREQUAL "rtems")
+    install(FILES drivers/standalone_driver/eefs_rtems_lock.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
 endif()
 if(EEFS_DRIVER STREQUAL "standalone")
     install(FILES drivers/standalone_driver/eefs_filesys.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)

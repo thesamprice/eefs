@@ -18,6 +18,10 @@
  *   Runs every case of the suite (or those whose name contains the substring) on the given geometry, prints PASS or
  *   FAIL per case, and exits non-zero on any failure, on an unknown suite, or when no case matched.
  *
+ *   When the library under test is built with EEFS_LIB_LOCK_HOOKS (CMake EEFS_LOCK=hooks, which reaches
+ *   eefs_nand_test_default through the eefs target), this file supplies the lock hooks: they count, and a case fails
+ *   if it leaves the lock held (every EEFS_LIB_LOCK must be paired with one EEFS_LIB_UNLOCK on every path).
+ *
  */
 
 /*
@@ -63,6 +67,11 @@ static const NandTest_Suite_t NandTest_Suites[] = {
 
 static int                  NandTest_Failures;      /* failures in the running case */
 
+#ifdef EEFS_LIB_LOCK_HOOKS
+static unsigned long        NandTest_LockCalls;     /* EEFS_LIB_LOCK calls since the start */
+static long                 NandTest_LockDepth;     /* locks held (one task: nesting depth) */
+#endif
+
 /*
  * Function Definitions
  */
@@ -84,6 +93,20 @@ void NandTest_FailRc(const char *File, int Line, const char *A, const char *B, l
     printf("    %s:%d: %s == %s failed: %ld != %ld\n", File, Line, A, B, VA, VB);
     NandTest_Failures++;
 }
+
+#ifdef EEFS_LIB_LOCK_HOOKS
+/* EEFS_LIB_LOCK / EEFS_LIB_UNLOCK of a library built with EEFS_LIB_LOCK_HOOKS */
+void EEFS_LibLockHook(void)
+{
+    NandTest_LockCalls++;
+    NandTest_LockDepth++;
+}
+
+void EEFS_LibUnlockHook(void)
+{
+    NandTest_LockDepth--;
+}
+#endif
 
 int NandTest_CaseFailed(void)
 {
@@ -163,6 +186,13 @@ int main(int argc, char *argv[])
         NandTest_Failures = 0;
         EEFS_LibInit();
         Case->Func();
+#ifdef EEFS_LIB_LOCK_HOOKS
+        if (NandTest_LockDepth != 0) {
+            printf("    the case left the library lock held (depth %ld)\n", NandTest_LockDepth);
+            NandTest_Failures++;
+            NandTest_LockDepth = 0;
+        }
+#endif
         Run++;
         if (NandTest_Failures == 0) {
             printf("PASS %s\n", Case->Name);
@@ -174,6 +204,9 @@ int main(int argc, char *argv[])
         fflush(stdout);
     }
 
+#ifdef EEFS_LIB_LOCK_HOOKS
+    printf("library lock hooks: %lu lock calls, all released\n", NandTest_LockCalls);
+#endif
     printf("%d case(s), %d failed\n", Run, Failed);
     if (Run == 0) {
         return(2);

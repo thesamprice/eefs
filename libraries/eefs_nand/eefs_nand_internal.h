@@ -12,8 +12,8 @@
  * Filename: eefs_nand_internal.h
  *
  * Purpose: Internal interfaces shared by the NAND backend's source files (and included by the host tests).  Not part
- *   of the public API.  Names and semantics are fixed by docs/nand-implementation.md section 3; the phase that
- *   implements each group is noted below.  Until then the functions are declared only.
+ *   of the public API.  Names and semantics are fixed by docs/nand-implementation.md section 3; each group below
+ *   names its source file.
  *
  */
 
@@ -40,7 +40,7 @@ extern EEFS_FileDescriptor_t    EEFS_FileDescriptorTable[EEFS_MAX_OPEN_FILES];
  * Exported Functions
  */
 
-/* I/O (eefs_nand_io.c, phase 2), section 3.1 */
+/* I/O (eefs_nand_io.c), section 3.1 */
 
 /* Uncached read; Data/Oob may be NULL.  EEFS_SUCCESS or EEFS_IO_ERROR (UNCORRECTABLE and IO_ERROR both map here;
  * *Corrected = 0xFFFFFFFF for uncorrectable). */
@@ -75,7 +75,7 @@ boolean         EEFS_NandPageIsErased(EEFS_InodeTable_t *Vol, uint32 Block, uint
  * < BlockCount).  EEFS_SUCCESS / EEFS_CORRUPT_FILE / EEFS_IO_ERROR.  *Raw = cache pointer for Blocks[] access. */
 int32           EEFS_NandReadPage0(EEFS_InodeTable_t *Vol, uint32 Block, EEFS_NandPage0_t *P, const uint8 **Raw);
 
-/* Journal (eefs_nand_journal.c, phase 2), section 3.2 */
+/* Journal (eefs_nand_journal.c), section 3.2 */
 
 /* Bytes of an entry bit mask (EntryMask, ForceDirty) */
 #define EEFS_NAND_MASK_BYTES            ((EEFS_MAX_FILES + 7) / 8)
@@ -121,7 +121,7 @@ boolean         EEFS_NandCleanupHasRoom(EEFS_InodeTable_t *Vol, uint32 Needed);
 void            EEFS_NandForgetCleanup(EEFS_InodeTable_t *Vol, uint16 Block);
 void            EEFS_NandDiff(EEFS_InodeTable_t *Vol, uint8 *EntryMask, uint32 *MapRanges);
 
-/* Allocation and lookup (eefs_nand_fileapi.c, phase 3), section 3.3 */
+/* Allocation and lookup (eefs_nand_fileapi.c), section 3.3 */
 
 int32           EEFS_NandParseName(const char *Name, char *Path, uint8 *SlotSpec);
 int32           EEFS_NandFindEntry(EEFS_InodeTable_t *Vol, const char *Path);
@@ -132,7 +132,7 @@ int32           EEFS_NandAllocEntry(EEFS_InodeTable_t *Vol);
 uint32          EEFS_NandFreeCount(EEFS_InodeTable_t *Vol);     /* Working.Map bytes == FREE in [DirRegionBlocks, BlockCount) */
 int32           EEFS_NandAllocBlocks(EEFS_InodeTable_t *Vol, uint32 Count, uint16 *Out, uint8 Owner, uint8 Class);
 
-/* Phase 2 implements the map/cleanup helpers below (ReleaseBlocks, FreeSlot, FreeBlocksExcept, Touch) */
+/* Map and cleanup-list helpers */
 
 /* Back to FREE (a BAD block stays BAD) */
 void            EEFS_NandReleaseBlocks(EEFS_InodeTable_t *Vol, const uint16 *Blocks, uint32 Count);
@@ -155,7 +155,7 @@ void            EEFS_NandSlotFailed(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 
 int32           EEFS_NandWriteCopy(EEFS_InodeTable_t *Vol, uint32 SrcEntry, uint8 SrcSlot, EEFS_NandPage0_t *NewP0, uint16 *DstBlocks);
 void            EEFS_NandTouch(EEFS_InodeTable_t *Vol);
 
-/* Rebuild (eefs_nand_rebuild.c, phase 4), section 3.4 */
+/* Rebuild and orphans (eefs_nand_rebuild.c), section 3.4 */
 
 int32           EEFS_NandRebuild(EEFS_InodeTable_t *Vol);
 void            EEFS_NandMountFinish(EEFS_InodeTable_t *Vol);   /* mount steps 6-8 (journal.c), shared with RebuildDirectory */

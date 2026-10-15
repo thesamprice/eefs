@@ -91,11 +91,14 @@ typedef struct
 } EEFS_NandVolumeInfo_t;
 int32   EEFS_LibGetVolumeInfo(EEFS_InodeTable_t *InodeTable, EEFS_NandVolumeInfo_t *Info);
 
-/* A/B.  Name must not carry a suffix for these. */
+/* A/B (docs/nand-implementation.md section 7).  Name must not carry a suffix for these (EEFS_INVALID_ARGUMENT); every
+ * call also returns EEFS_READ_ONLY_FILE_SYSTEM when write-protected.  The setters change Working only: commit to make
+ * them durable.  The "All" counts are the entries the setting was applied to, whether or not a value changed; a
+ * non-zero Flag is stored as 1.  SetActiveSlot(+All) clears ActiveFailed, also when the slot is already active. */
 int32   EEFS_LibSetActiveSlot(EEFS_InodeTable_t *InodeTable, char *Name, uint8 Slot);
-int32   EEFS_LibSetActiveSlotAll(EEFS_InodeTable_t *InodeTable, uint8 Slot);             /* >= 0: entries changed */
+int32   EEFS_LibSetActiveSlotAll(EEFS_InodeTable_t *InodeTable, uint8 Slot);             /* >= 0: A/B entries set */
 int32   EEFS_LibSetFallbackCompatible(EEFS_InodeTable_t *InodeTable, char *Name, uint8 Flag);
-int32   EEFS_LibSetFallbackCompatibleAll(EEFS_InodeTable_t *InodeTable, uint8 Flag);     /* >= 0: entries changed */
+int32   EEFS_LibSetFallbackCompatibleAll(EEFS_InodeTable_t *InodeTable, uint8 Flag);     /* >= 0: A/B entries set */
 int32   EEFS_LibSetFailed(EEFS_InodeTable_t *InodeTable, char *Name);
 int32   EEFS_LibClearFailed(EEFS_InodeTable_t *InodeTable, char *Name);
 int32   EEFS_LibCopySlot(EEFS_InodeTable_t *InodeTable, char *Name, uint8 From, uint8 To);

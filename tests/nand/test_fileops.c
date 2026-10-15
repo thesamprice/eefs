@@ -412,7 +412,7 @@ static void name_rules(void)
     CHECK_RC(EEFS_NandParseName("/cf/apps/x.so", Path, &Spec), EEFS_SUCCESS);
     CHECK_EQ(Spec, EEFS_NAND_SLOT_NONE);
 
-    /* an explicit slot works (A/B behaviour beyond that is phase 5) */
+    /* an explicit slot works (the A/B rules are tested by the ab suite) */
     F = T_File("/ok", 10, 3);
     CHECK_RC(V_WriteName("/ok@B", &F), EEFS_SUCCESS);
     CHECK_RC(EEFS_LibStat(&V_Vol, "/ok@B", &St), EEFS_SUCCESS);

@@ -35,9 +35,10 @@
 
 /* These macros define the lock and unlock interface functions used to guarentee
  * exclusive access to shared resources.  Defaults to undefined since it is implementation dependent.
- * With EEFS_LIB_LOCK_HOOKS defined they call EEFS_LibLockHook() and EEFS_LibUnlockHook(), which the application
- * provides (one recursive mutex for the whole library; the NAND backend needs it when several tasks use the
- * library, e.g. a background health check, see docs/nand-implementation.md section 13). */
+ * With EEFS_LIB_LOCK_HOOKS defined they call EEFS_LibLockHook() and EEFS_LibUnlockHook(): one recursive mutex for the
+ * whole library, needed when several tasks use the library (e.g. a background NAND health check next to writers, see
+ * docs/nand-implementation.md section 13).  CMake EEFS_LOCK=hooks defines it and the application provides the hooks;
+ * EEFS_LOCK=rtems defines it and links the EEFS-provided RTEMS implementation (eefs_rtems_lock.c). */
 #ifdef EEFS_LIB_LOCK_HOOKS
 extern void EEFS_LibLockHook(void);
 extern void EEFS_LibUnlockHook(void);

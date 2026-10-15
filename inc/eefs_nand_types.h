@@ -61,11 +61,11 @@
 #define EEFS_HEALTH_AB_VERSION_MISMATCH         24  /* Aux0 = Version A, Aux1 = Version B (informational) */
 #define EEFS_HEALTH_AB_FALLBACK_UNAVAILABLE     25  /* informational */
 #define EEFS_HEALTH_AB_FAILED_FLAG_SET          26
-#define EEFS_HEALTH_AB_LOAD_MIXED               27  /* one finding; Path = first entry whose ActiveSlot differs from entry 0's (informational) */
+#define EEFS_HEALTH_AB_LOAD_MIXED               27  /* one finding; Path = first entry whose ActiveSlot differs from the first A/B entry's (informational) */
 #define EEFS_HEALTH_DIR_PAGE0_MISMATCH          30  /* Path, Slot, Block, Aux0 = reason (1 Path, 2 Slot, 3 BlockCount, 4 copied fields): page 0 disagrees with the directory entry */
 /* 31 was DIR_PAGE0_STALE (removed with in-place modify; copied fields can no longer be legitimately stale).  Do not reuse. */
 #define EEFS_HEALTH_MAP_MISMATCH                32  /* Block, Aux0 = map value, Aux1 = OWNER expected or 0xFFFF */
-#define EEFS_HEALTH_BLOCK_CROSSLINKED           33  /* Path, Slot (second claimant), Block, Aux0 = OWNER of the first claimant */
+#define EEFS_HEALTH_BLOCK_CROSSLINKED           33  /* Path, Slot (second claimant), Block, Aux0 = the block's map value (normally the first claimant's OWNER) */
 #define EEFS_HEALTH_BADBLOCK_UNRECORDED         34  /* Block */
 #define EEFS_HEALTH_ORPHAN_FILE                 35  /* Path (from page 0), Slot (page 0 Slot), Block, Aux0 = WriteSeq */
 #define EEFS_HEALTH_FREE_BELOW_RESERVE          40  /* Aux0 = free blocks, Aux1 = EEFS_NAND_RESERVE_BLOCKS; informational unless free < EEFS_NAND_BADBLOCK_RESERVE */
