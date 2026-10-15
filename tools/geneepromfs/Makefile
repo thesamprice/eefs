@@ -39,7 +39,7 @@ LINKER=gcc
 WARNINGS = -Wall -W -ansi -Werror -Wstrict-prototypes -Wundef
 DEBUGGER = -g
 
-COPT = $(WARNINGS) $(DEBUGGER) -D_ix86_ -m32 
+COPT = $(WARNINGS) $(DEBUGGER) -D_ix86_
 
 LOPT = -lm
 

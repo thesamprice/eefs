@@ -134,12 +134,12 @@ int main(int argc, char** argv) {
                 if (CommandLineOptions.Verbose) {
 
                     printf("Max Number Of Files: %i\n", EEFS_MAX_FILES);
-                    printf("Number Of Files Added: %lu\n", NumberOfFiles);
-                    printf("EEPROM Size: %lu\n", CommandLineOptions.EEPromSize);
-                    printf("Allocated EEPROM: %lu\n", FreeMemoryOffset);
-                    printf("Unallocated EEPROM: %lu\n", FreeMemorySize);
+                    printf("Number Of Files Added: %lu\n", (unsigned long)NumberOfFiles);
+                    printf("EEPROM Size: %lu\n", (unsigned long)CommandLineOptions.EEPromSize);
+                    printf("Allocated EEPROM: %lu\n", (unsigned long)FreeMemoryOffset);
+                    printf("Unallocated EEPROM: %lu\n", (unsigned long)FreeMemorySize);
                     printf("Utilization: %.0f%%\n", ((double)FreeMemoryOffset / (double)CommandLineOptions.EEPromSize) * 100.0);
-                    printf("Image Checksum: 0x%lx\n", FileSystemCrc);
+                    printf("Image Checksum: 0x%lx\n", (unsigned long)FileSystemCrc);
                 }
             }
             else {
@@ -189,8 +189,8 @@ void AddFile(FileSystem_t *FileSystem, char *InputFilename, char *EEFSFilename, 
                     FileHeader->InUse = TRUE;
                     FileHeader->Attributes = Attributes;
                     FileHeader->FileSize = FileSize;
-                    FileHeader->ModificationDate = CommandLineOptions.TimeStamp;
-                    FileHeader->CreationDate = CommandLineOptions.TimeStamp;
+                    FileHeader->ModificationDate = (uint32)CommandLineOptions.TimeStamp;
+                    FileHeader->CreationDate = (uint32)CommandLineOptions.TimeStamp;
                     strncpy(FileHeader->Filename, EEFSFilename, EEFS_MAX_FILENAME_SIZE);
 
                     FileData = FileSystem->BaseAddress + FileSystem->FileAllocationTable->File[FileSystem->FileAllocationTable->Header.NumberOfFiles].FileHeaderOffset + sizeof(EEFS_FileHeader_t);
@@ -254,9 +254,9 @@ void OutputMemoryMap(FileSystem_t *FileSystem, char *Filename)
     if ((FilePointer = fopen(Filename, "w"))) {
 
         fprintf(FilePointer, "Offset\tSize\tSection\tSlot\tFilename\tFile Size\tSpare\tMax Size\tCrc\tAttributes\n");
-        fprintf(FilePointer, "%i\t%i\t%s\n",
+        fprintf(FilePointer, "%i\t%lu\t%s\n",
             0,
-            sizeof(EEFS_FileAllocationTable_t),
+            (unsigned long)sizeof(EEFS_FileAllocationTable_t),
             "FAT");
 
         for (i=0; i < FileSystem->FileAllocationTable->Header.NumberOfFiles; i++) {
@@ -264,28 +264,28 @@ void OutputMemoryMap(FileSystem_t *FileSystem, char *Filename)
             FileHeader = FileSystem->BaseAddress + FileSystem->FileAllocationTable->File[i].FileHeaderOffset;
             FileData = FileSystem->BaseAddress + FileSystem->FileAllocationTable->File[i].FileHeaderOffset + sizeof(EEFS_FileHeader_t);
 
-            fprintf(FilePointer, "%lu\t%i\t%s\t%lu\n",
-                    FileSystem->FileAllocationTable->File[i].FileHeaderOffset,
-                    sizeof(EEFS_FileHeader_t),
+            fprintf(FilePointer, "%lu\t%lu\t%s\t%lu\n",
+                    (unsigned long)FileSystem->FileAllocationTable->File[i].FileHeaderOffset,
+                    (unsigned long)sizeof(EEFS_FileHeader_t),
                     "Header",
-                    i);
+                    (unsigned long)i);
 
             fprintf(FilePointer, "%lu\t%lu\t%s\t%lu\t%s\t%lu\t%lu\t%lu\t0x%08lX\t%lu\n",
-                    FileSystem->FileAllocationTable->File[i].FileHeaderOffset + sizeof(EEFS_FileHeader_t),
-                    FileSystem->FileAllocationTable->File[i].MaxFileSize,
+                    (unsigned long)(FileSystem->FileAllocationTable->File[i].FileHeaderOffset + sizeof(EEFS_FileHeader_t)),
+                    (unsigned long)FileSystem->FileAllocationTable->File[i].MaxFileSize,
                     "Data",
-                    i,
+                    (unsigned long)i,
                     FileHeader->Filename,
-                    FileHeader->FileSize,
-                   (FileSystem->FileAllocationTable->File[i].MaxFileSize - FileHeader->FileSize),
-                    FileSystem->FileAllocationTable->File[i].MaxFileSize,
-                    CalculateCRC(FileData, FileHeader->FileSize, 0),
-                    FileHeader->Attributes);
+                    (unsigned long)FileHeader->FileSize,
+                    (unsigned long)(FileSystem->FileAllocationTable->File[i].MaxFileSize - FileHeader->FileSize),
+                    (unsigned long)FileSystem->FileAllocationTable->File[i].MaxFileSize,
+                    (unsigned long)CalculateCRC(FileData, FileHeader->FileSize, 0),
+                    (unsigned long)FileHeader->Attributes);
         }
 
         fprintf(FilePointer, "%lu\t%lu\t%s\n",
-                FileSystem->FileAllocationTable->Header.FreeMemoryOffset,
-                FileSystem->FileAllocationTable->Header.FreeMemorySize,
+                (unsigned long)FileSystem->FileAllocationTable->Header.FreeMemoryOffset,
+                (unsigned long)FileSystem->FileAllocationTable->Header.FreeMemorySize,
                 "Free");
 
         fclose(FilePointer);
@@ -319,8 +319,8 @@ void ByteSwapFileSystem(FileSystem_t *FileSystem)
         SwapUInt32(&FileHeader->InUse);
         SwapUInt32(&FileHeader->Attributes);
         SwapUInt32(&FileHeader->FileSize);
-        SwapUInt32((uint32 *)&FileHeader->ModificationDate);
-        SwapUInt32((uint32 *)&FileHeader->CreationDate);
+        SwapUInt32(&FileHeader->ModificationDate);
+        SwapUInt32(&FileHeader->CreationDate);
 
         /* this is done last because I use the FileHeaderOffset to calculate the
          * address of the file header above. */

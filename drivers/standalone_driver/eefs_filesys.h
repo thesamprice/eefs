@@ -23,8 +23,8 @@
 **   The device table defines multiple devices or instances of the eeprom file system.  The device table is initialized by
 **   calling the function EEFS_InitFS and requires a unique device name and the base address if the file system in eeprom.
 **
-**   EEFS_InitFS("/EEDEV0", (uint32)FileSystemBaseAddress1);
-**   EEFS_InitFS("/EEDEV1", (uint32)FileSystemBaseAddress2);
+**   EEFS_InitFS("/EEDEV0", (cpuaddr)FileSystemBaseAddress1);
+**   EEFS_InitFS("/EEDEV1", (cpuaddr)FileSystemBaseAddress2);
 **
 ** The Volume Table:
 **   In order to access a device it must be mounted by calling the function EEFS_Mount.  Mounting the device maps a volume name
@@ -68,7 +68,7 @@
 typedef struct
 {
     uint32                              InUse;
-    uint32                              BaseAddress;
+    cpuaddr                             BaseAddress;
     char                                DeviceName[EEFS_MAX_DEVICENAME_SIZE];
     EEFS_InodeTable_t                   InodeTable;
 } EEFS_Device_t;
@@ -92,7 +92,7 @@ typedef struct
 
 /* Adds a device to the DeviceTable and calls EEFS__InitFS to initialize the file system.  Note that the DeviceName
  * and the BaseAddress of the file system must be unique. */
-int32                           EEFS_InitFS(char *DeviceName, uint32 BaseAddress);
+int32                           EEFS_InitFS(char *DeviceName, cpuaddr BaseAddress);
 
 /* Mounts a device by mapping a MountPoint to a DeviceName.  The device must be initialized prior
    to mounting it by calling EEFS_InitFS. */

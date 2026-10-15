@@ -235,8 +235,8 @@ typedef struct
     uint32                              InUse;  /* if InUse is FALSE then the file has been deleted */
     uint32                              Attributes;
     uint32                              FileSize;
-    time_t                              ModificationDate;
-    time_t                              CreationDate;
+    uint32                              ModificationDate;   /* time_t seconds, stored as 32 bits so the layout is host independent */
+    uint32                              CreationDate;
     char                                Filename[EEFS_MAX_FILENAME_SIZE];
 } EEFS_FileHeader_t;
 
@@ -248,7 +248,7 @@ typedef struct
 
 typedef struct
 {
-    uint32                              BaseAddress;
+    cpuaddr                             BaseAddress;
     void                               *FreeMemoryPointer;
     uint32                              FreeMemorySize;
     uint32                              NumberOfFiles;
@@ -303,7 +303,7 @@ typedef struct
 void                            EEFS_LibInit(void);
 
 /* Initializes the Inode Table.  Returns EEFS_SUCCESS on success, EEFS_NO_SUCH_DEVICE or EEFS_INVALID_ARGUMENT on error. */
-int32                           EEFS_LibInitFS(EEFS_InodeTable_t *InodeTable, uint32 BaseAddress);
+int32                           EEFS_LibInitFS(EEFS_InodeTable_t *InodeTable, cpuaddr BaseAddress);
 
 /* Clears the Inode Table.  Returns EEFS_SUCCESS on success, EEFS_DEVICE_IS_BUSY or EEFS_INVALID_ARGUMENT on error. */
 int32                           EEFS_LibFreeFS(EEFS_InodeTable_t *InodeTable);

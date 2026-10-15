@@ -39,7 +39,7 @@ typedef struct
     char            BdmDeviceName[FILENAME_SIZE];
     boolean         BdmDeviceEntered;
 
-    uint32          EEFSMemoryAddress;
+    cpuaddr         EEFSMemoryAddress;
     boolean         EEFSMemoryAddressEntered;
 
     boolean         DirectoryListingCommand;

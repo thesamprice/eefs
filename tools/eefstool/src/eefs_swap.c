@@ -96,8 +96,8 @@ void EEFS_SwapFileHeader( EEFS_FileHeader_t  *FileHeader)
     SwapUInt32(&FileHeader->InUse);
     SwapUInt32(&FileHeader->Attributes);
     SwapUInt32(&FileHeader->FileSize);
-    SwapUInt32((uint32 *)&FileHeader->ModificationDate);
-    SwapUInt32((uint32 *)&FileHeader->CreationDate);
+    SwapUInt32(&FileHeader->ModificationDate);
+    SwapUInt32(&FileHeader->CreationDate);
 }
 
 /*

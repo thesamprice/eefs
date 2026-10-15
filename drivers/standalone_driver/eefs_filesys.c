@@ -56,7 +56,7 @@ int32                    EEFS_FreeVolume(EEFS_Volume_t *Volume);
 
 /* Adds a device to the DeviceTable and calls EEFS_LibInitFS to initialize the file system.  Note that the DeviceName
  * and the BaseAddress of the file system must be unique. */
-int32 EEFS_InitFS(char *DeviceName, uint32 BaseAddress)
+int32 EEFS_InitFS(char *DeviceName, cpuaddr BaseAddress)
 {
     EEFS_Device_t               *Device;
     uint32                       i;
