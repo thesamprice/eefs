@@ -31,13 +31,13 @@ The format supports:
 
 | Parameter | Constraint |
 |---|---|
-| `PageSize` | 2048, 4096 or 8192 (a power of two, >= 2048). 512-byte pages are **rejected**. |
+| `PageSize` | A power of two, >= 2048 and <= the build's `EEFS_NAND_MAX_PAGE_SIZE` (default 4096). 2048, 4096 and 8192 are the tested values. 512-byte pages are **rejected**. |
 | `OobSize` | >= 1, <= the build's `EEFS_NAND_MAX_OOB_SIZE`. |
 | `PagesPerBlock` | >= 2 * (max checkpoint pages + 1), see 4.6. 64 and 128 are the tested values. |
 | `BlockCount` | >= `DirRegionBlocks + 1`, <= the build's `EEFS_NAND_MAX_BLOCKS` (4096). Blocks are numbered `0..BlockCount-1` across all chips; chip select is the HAL's business. |
 | `DirRegionBlocks` | Even, >= 4, <= the build's `EEFS_NAND_MAX_DIR_BLOCKS` (32). Default 16. |
-| `BadMarkerOffset` | OOB byte index of the bad-block marker. Default 0. |
-| `BadMarkerPages` | Bitmask of pages that carry the factory marker: bit 0 = page 0, bit 1 = page 1, bit 2 = last page. |
+| `BadMarkerOffset` | OOB byte index of the bad-block marker, < `OobSize`. Default 0. |
+| `BadMarkerPages` | Non-zero bitmask of pages that carry the factory marker: bit 0 = page 0, bit 1 = page 1, bit 2 = last page. |
 
 A block is **bad** when the byte at `BadMarkerOffset` of any page selected by `BadMarkerPages`
 is not `0xFF`. The library marks grown-bad blocks by programming `0x00` into that byte of the
@@ -450,7 +450,10 @@ This is the algorithm both the library and the bootloader use. It reads at most
 2. For each mirror, order its candidates by `Seq` descending. For each candidate in that order:
    walk the block's chain (step 3). The first candidate whose first record (the checkpoint) is
    valid is that mirror's **current block**; candidates with a higher `Seq` whose checkpoint is
-   torn are ignored (the writer was interrupted while entering that block).
+   torn are ignored (the writer was interrupted while entering that block). The library never writes
+   two checkpoints with the same `Seq` into one mirror. A reader that meets them anyway (a damaged or
+   foreign image) should walk each and keep the longest chain, as the library's mount does;
+   `microeefs_nand` takes the first valid one in ascending block order.
 3. Walking a chain: start at page 0. Read the record header, validate the record (4.2) by reading
    all its pages. If valid, note `LastSeq = Seq`, advance to page `p + PageCount`, and repeat while
    `p < PagesPerBlock`. A TXN's `Seq` must be exactly `LastSeq + 1`; otherwise stop. Stop at the
@@ -509,8 +512,8 @@ and persists it at the next commit or `EEFS_RepairDirectory`.
 
 ### 7.1 Inputs
 
-The bootloader needs `ReadPage`, the geometry, one page buffer of `PageSize` bytes and about one
-kilobyte of stack. It never writes.
+The bootloader needs `ReadPage`, the geometry, one page buffer of `PageSize` bytes and about 1.5 KB
+of stack (`microeefs_nand`, measured with `arm-rtems7-gcc -O2`). It never writes.
 
 ### 7.2 Finding a file
 
@@ -551,7 +554,8 @@ return rc with ActiveFailed = 1                 /* EEFS_CORRUPT_FILE or EEFS_IO_
 ```
 
 A name with an explicit `@A` / `@B` suffix (the library's name rule) selects that copy only: it must be
-in use (else `EEFS_FILE_NOT_FOUND`), the hook is not called and there is no fallback.
+in use (else `EEFS_FILE_NOT_FOUND`), the hook is not called and there is no fallback. A failure of an
+explicit copy reports `ActiveFailed = 1` only when that copy is the active one.
 
 The hook exists for automatic rollback after a boot that crashed without a CRC failure (for
 example a boot counter in persistent RAM). The hook's choice is tried first, as the BSP's explicit
@@ -589,3 +593,24 @@ page buffer re-reads page 0 at each block transition; it is one extra page read 
 | Commit, during cleanup | State `S`, pending cleanup in the newest record. The library finishes it before its next write. |
 | Entering a new ring block (erase, or writing the checkpoint) | The previous block still holds the complete state `S-1`. |
 | Format | Either no valid checkpoint (`EEFS_NOT_FORMATTED`, format again) or a complete empty volume. When an existing volume is formatted again, a cut while the directory region is being erased can also leave the complete old volume (from the mirror not yet erased). |
+
+## 9. Device assumptions
+
+The format relies on these properties of the NAND part and its controller (the HAL contract,
+`inc/eefs_nand_hal.h`, states them for BSP authors):
+
+- **NOP = 1.** A page is programmed at most once between erases; the library never re-programs a page.
+  (The one exception is the best-effort OOB-only write of a bad-block marker into a block that is being
+  retired.) A record or a metadata page is therefore never patched: torn writes are detected by CRC and
+  the writer moves on (a mirror starts a new block rather than programming after a torn page).
+- **In-order programming.** The pages of a block are programmed in ascending order, from page 0. Unused
+  pages at the end of a block are left erased.
+- **Erased pages read `0xFF`.** An erased page reads as all `0xFF` with a non-error status. A controller
+  whose ECC flags erased pages as uncorrectable must special-case them in its `ReadPage`, or erased-page
+  detection (chain ends, cleanup state) breaks.
+- **The OOB marker byte is programmable on its own.** The bad-block marker byte at `BadMarkerOffset` can be
+  programmed without disturbing the controller's ECC bytes. Writing it is best effort: the directory map
+  records the block as bad whether or not the marker write succeeds.
+- **Reads of a factory-bad block** with no data buffer return the raw OOB, so the marker can be read; an
+  error there makes the block count as bad.
+- The data-page OOB belongs to the controller's ECC; EEFS stores nothing there.

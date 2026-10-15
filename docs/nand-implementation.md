@@ -1,10 +1,11 @@
 # EEFS NAND backend: implementation specification
 
-This is the internal specification for the NAND backend of EEFS. Engineers implement it phase by
-phase (section 14); every interface between phases is pinned here. The on-media format is in
-`docs/nand-format.md` (referred to as *FMT*), which is normative for everything written to NAND.
-The user-approved requirements are the plan in the PR description; deviations from it are listed in
-section 15.
+This is the internal specification for the NAND backend of EEFS, describing the backend as delivered.
+It was implemented in eight phases (section 14 records them and their test suites); every interface
+between modules is pinned here. The on-media format is in `docs/nand-format.md` (referred to as
+*FMT*), which is normative for everything written to NAND. The user-approved requirements are the
+plan in the PR description; deviations from it are listed in section 15, open risks and known
+limitations in section 16, and the user's decisions and the delivery history in section 17.
 
 Conventions for all new code: C89 (`-std=c90`, `/* */` comments), NASA banner, `EEFS_` prefixes,
 `int8..uint64`/`cpuaddr`/`boolean` from `common_types.h`, no `malloc` in library or bootloader
@@ -37,14 +38,18 @@ New:
 | `tests/nand/nand_test.h`, `nand_test_main.c` | Test harness (CHECK macros, suite table, geometry from argv) |
 | `tests/nand/test_*.c` | Test suites (section 14) |
 | `tests/nand/CMakeLists.txt` | Registers the host tests per geometry |
-| `tests/rtems/eefs_rtems_nand_test.c` | RTEMS QEMU test for the NAND backend |
+| `tests/rtems/eefs_rtems_nand_test.c` | RTEMS QEMU end-to-end test for the NAND backend (14, phase 8) |
+| `drivers/standalone_driver/eefs_rtems_lock.[ch]` | The EEFS-provided RTEMS library lock, built with `EEFS_LOCK=rtems` (section 13) |
 
 Modified: `inc/eefs_fileapi.h`, `inc/eefs_config.h`, `drivers/standalone_driver/eefs_filesys.[ch]`,
-`CMakeLists.txt`, `tests/rtems/CMakeLists.txt`, `CLAUDE.md`, `README.md`. (`tools/CMakeLists.txt` needs no
+`drivers/standalone_driver/eefs_macros.h` (the opt-in lock hooks, section 13), `CMakeLists.txt`,
+`tests/rtems/CMakeLists.txt`, `tests/rtems/eefs_rtems_test.c` (runs with every `EEFS_LOCK` value), `CLAUDE.md`,
+`README.md`. (`tools/CMakeLists.txt` needs no
 change: the top-level `CMakeLists.txt` does not add `tools/` for the NAND backend.)
 
 Untouched: `libraries/eepromfs/`, `libraries/microeefs/`, `tools/`, `tests/golden/`, `tests/data/`,
-`tests/run_test.cmake`, `tests/CMakeLists.txt`, `tools/geneepromfs/eefs_config.h`.
+`tests/run_test.cmake`, `tests/CMakeLists.txt`, `tools/geneepromfs/eefs_config.h`. The EEPROM backend's objects
+are byte-identical to the baseline in the default configuration (`EEFS_LOCK=none`).
 
 ### 1.2 CMake
 
@@ -66,6 +71,7 @@ set_property(CACHE EEFS_BACKEND PROPERTY STRINGS eeprom nand)
 | `tests/nand/` | not added | added when `BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING` |
 | `tests/rtems/` | `eefs_rtems_test.c` + embedded image | `eefs_rtems_nand_test.c` + `tests/nand/nand_sim.c` |
 | Installed headers | as before + `inc/eefs_eeprom_types.h` | shared + `eefs_nand*.h` + `microeefs_nand.h` |
+| `EEFS_LOCK` (both backends, section 13) | `none` (default): no lock; `hooks`; `rtems` (RTEMS targets only) | same |
 
 ```cmake
 set(EEFS_NAND_LIB_SOURCES
@@ -80,9 +86,9 @@ set(EEFS_NAND_LIB_SOURCES
 
 `EEFS_DRIVER` must be `standalone` when `EEFS_BACKEND` is `nand` (fatal error otherwise). The
 `eefs` and `microeefs` targets keep `C_STANDARD 90`, `C_EXTENSIONS OFF`, `EEFS_WARNING_FLAGS`.
-`cmake/rtems-toolchain.cmake` needs no change. Phase 1 must verify that an `eeprom` configure
-produces an identical build (same source lists, same definitions) and that all four golden tests
-pass.
+`cmake/rtems-toolchain.cmake` needs no change. An `eeprom` configure with the default `EEFS_LOCK=none` must
+produce the baseline build (same source lists, same definitions, byte-identical objects) and pass all four golden
+tests.
 
 `tests/nand/CMakeLists.txt` builds one static library `eefs_nand_testlib` from
 `${EEFS_NAND_LIB_SOURCES}` + `drivers/standalone_driver/eefs_filesys.c` + `nand_sim.c` with
@@ -101,7 +107,7 @@ set(EEFS_NAND_TEST_BLOCKS 4096)
 foreach(geom_text IN LISTS EEFS_NAND_GEOMETRIES)
     string(REPLACE ":" ";" geom ${geom_text})
     list(GET geom 0 page) ... 
-    foreach(suite IN LISTS EEFS_NAND_SUITES)   # layout sim journal fileops powercut rebuild ab health micro
+    foreach(suite IN LISTS EEFS_NAND_SUITES)   # layout sim journal micro fileops powercut ab rebuild health
         add_test(NAME nand_${suite}_${page}_${oob}_${ppb}
                  COMMAND eefs_nand_test ${suite} ${page} ${oob} ${ppb} ${EEFS_NAND_TEST_BLOCKS})
     endforeach()
@@ -113,7 +119,8 @@ add_test(NAME nand_verify_on_open_ab_4096 COMMAND eefs_nand_test_verifyopen ab 4
 
 `eefs_nand_test <suite> <page> <oob> <ppb> <blocks> [case-substring]` runs every case of the suite
 (or those whose name contains the substring), prints `PASS`/`FAIL` per case and exits non-zero on
-any failure. Suites are added to `EEFS_NAND_SUITES` as the phases land.
+any failure. Nine suites on three geometries plus the three extra executables' tests make 30 CTest tests; they
+take about six minutes and must run serially (section 14).
 
 ## 2. Headers
 
@@ -208,7 +215,7 @@ only). `tools/geneepromfs/eefs_config.h` is **not** touched.
 #define EEFS_NAND_AUTO_COMMIT            0
 #endif
 #ifndef EEFS_NAND_WRITE_RETRIES
-#define EEFS_NAND_WRITE_RETRIES          3       /* restarts of a file write after a grown bad block */
+#define EEFS_NAND_WRITE_RETRIES          3       /* restarts of a file or directory write after a grown bad block */
 #endif
 #ifndef EEFS_NAND_WRITESEQ_MOUNT_GAP
 #define EEFS_NAND_WRITESEQ_MOUNT_GAP     1024    /* added to WriteSeq at mount, see 5.2 step 8 */
@@ -287,7 +294,7 @@ HAL contract (document in the header comment):
 - `ProgramPage`: `Data` or `Oob` may be `NULL` to leave that area untouched. Programming only the
   OOB is used for the bad-block marker and is best effort (the return value is ignored there).
   The library programs pages of a block in ascending order and never programs a page twice between
-  erases.
+  erases (except the best-effort OOB-only bad-block marker of a block being retired).
 - `EraseBlock`: returns `0` or `-1`. The library marks a block bad after a failed erase.
 - All calls are made under `EEFS_LIB_LOCK`.
 
@@ -425,6 +432,7 @@ CRC table):
 uint32  EEFS_Crc32Update(uint32 State, const void *Data, uint32 Length);   /* feed bytes */
 uint32  EEFS_Crc32Final(uint32 State);                                      /* State ^ 0xFFFFFFFF */
 uint32  EEFS_Crc32(const void *Data, uint32 Length);                        /* one-shot */
+void    EEFS_Crc32Update2(uint32 *StateA, uint32 *StateB, const void *Data, uint32 Length);  /* feeds two CRCs in one pass (a block CRC and the file CRC) */
 
 void    EEFS_NandPut16(uint8 *P, uint16 V);  void EEFS_NandPut32(uint8 *P, uint32 V);  void EEFS_NandPut64(uint8 *P, uint64 V);
 uint16  EEFS_NandGet16(const uint8 *P);      uint32 EEFS_NandGet32(const uint8 *P);     uint64 EEFS_NandGet64(const uint8 *P);
@@ -608,7 +616,7 @@ typedef struct {
 } EEFS_NandVolumeInfo_t;
 int32 EEFS_LibGetVolumeInfo(EEFS_InodeTable_t *T, EEFS_NandVolumeInfo_t *Info);
 
-/* A/B. Section 7. Name must not carry a suffix for these (INVALID_ARGUMENT). As delivered, every A/B call also returns
+/* A/B. Section 7. Name must not carry a suffix for these (INVALID_ARGUMENT). Every A/B call also returns
  * READ_ONLY_FILE_SYSTEM when EEFS_LIB_IS_WRITE_PROTECTED; the "All" counts are the entries the setting was applied to,
  * whether or not a value changed; a non-zero Flag is stored as 1. */
 int32 EEFS_LibSetActiveSlot(EEFS_InodeTable_t *T, char *Name, uint8 Slot);        /* SUCCESS, FILE_NOT_FOUND (entry or that slot not in use), INVALID_ARGUMENT (not IsAB, bad slot) */
@@ -623,7 +631,7 @@ int32 EEFS_LibCopySlotAll(EEFS_InodeTable_t *T, uint8 From, uint8 To);          
 /* Directory maintenance. Section 8. */
 int32 EEFS_LibRepairDirectory(EEFS_InodeTable_t *T);     /* commits pending changes and writes a fresh CHECKPOINT to both mirrors; clears DirectoryRebuilt. SUCCESS, IO_ERROR */
 int32 EEFS_LibRebuildDirectory(EEFS_InodeTable_t *T);    /* discards RAM directory state (requires no open files/dir and no uncommitted changes) and rebuilds from page 0s. SUCCESS, DEVICE_IS_BUSY, TRANSACTION_ERROR, NOT_FORMATTED, IO_ERROR */
-int32 EEFS_LibReclaimOrphans(EEFS_InodeTable_t *T);      /* erases blocks with a valid page 0 that no Working slot references. >= 0 blocks erased, or READ_ONLY_FILE_SYSTEM (as delivered, 8.4) */
+int32 EEFS_LibReclaimOrphans(EEFS_InodeTable_t *T);      /* erases free blocks with a valid page 0 that nothing references (8.4). >= 0 blocks erased, or READ_ONLY_FILE_SYSTEM */
 
 /* Health check. Section 10. */
 int32 EEFS_LibHealthCheckStart(EEFS_InodeTable_t *T, EEFS_HealthReport_t *Report);   /* SUCCESS, DEVICE_IS_BUSY (another report active on T) */
@@ -686,7 +694,7 @@ int32 EEFS_ReclaimOrphans(char *MountPoint);
 int32 EEFS_HealthCheckStart(char *MountPoint, EEFS_HealthReport_t *Report);
 int32 EEFS_HealthCheckStep(char *MountPoint, uint32 MaxPageReads);
 int32 EEFS_HealthCheckSummary(char *MountPoint, EEFS_HealthSummary_t *Out);
-int32 EEFS_HealthCheckCancel(char *MountPoint);                 /* added in phase 6 */
+int32 EEFS_HealthCheckCancel(char *MountPoint);
 #endif
 ```
 
@@ -744,10 +752,10 @@ boolean EEFS_NandPageIsErased(Vol, uint32 Block, uint32 Page);   /* uncached dat
 
 `EEFS_NandProgramPage` uses `Vol->PageBuf` as the read-back scratch; callers that are building the
 page *in* `PageBuf` (record pages, page 0) must use `EEFS_NandProgramPageVerified` with
-`Vol->CacheBuf` as scratch (the cache is invalidated anyway). As delivered, a scratch equal to the
-source is replaced by the other buffer, and directory record pages are verified the same way (a byte
-compare of the read-back in `CacheBuf`, done by `EEFS_NandWriteRecord`), which is stricter than a
-header decode and needs no extra buffer. `EEFS_NandMarkBad` removes a directory block from its ring by
+`Vol->CacheBuf` as scratch (the cache is invalidated anyway). A scratch equal to the source is replaced
+by the other buffer. Directory record pages are verified the same way (a byte compare of the read-back
+in `CacheBuf`, done by `EEFS_NandWriteRecord`), which is stricter than a header decode and needs no extra
+buffer. Every successful program and erase bumps `VolumeChangeCounter` (section 4). `EEFS_NandMarkBad` removes a directory block from its ring by
 shifting the ring down; if the removed block was the current one, `CurIndex` moves to its predecessor
 (so the next `EnterBlock` lands on the block that followed it) and `EnterNewBlock` is set.
 
@@ -780,12 +788,13 @@ boolean EEFS_NandCleanupHasRoom(Vol, uint32 Needed);
 void    EEFS_NandForgetCleanup(Vol, uint16 Block);           /* remove Block if present (called by the allocator) */
 void    EEFS_NandDiff(Vol, uint8 *EntryMask, uint32 *MapRanges);   /* computes the dirty entry mask (memcmp + ForceDirty) and counts changed map bytes */
 
-/* Added in phase 2 (journal.c), so that EEFS_LibFormat / EEFS_LibInitFS stay thin and phase 4 can hook the mount: */
+/* Also in journal.c, so that EEFS_LibFormat / EEFS_LibInitFS stay thin: */
 #define EEFS_NAND_MASK_BYTES / EEFS_NAND_MASK_TEST(m,i) / EEFS_NAND_MASK_SET(m,i)   /* entry bit masks (EntryMask, ForceDirty) */
 int32   EEFS_NandCheckGeometry(Vol);               /* 5.1 step 1 on Vol->Dev; fills the cached sizes; uses Vol->Base as scratch. SUCCESS / INVALID_ARGUMENT */
 uint32  EEFS_NandMaxCheckpointPages(Vol);          /* dry run of a CHECKPOINT with every entry in use and the full map */
 int32   EEFS_NandFormat(Vol);                      /* 5.1 steps 2-6 */
-int32   EEFS_NandMount(Vol);                       /* 5.2 steps 2-9 (step 5 returns EEFS_NOT_FORMATTED until phase 4) */
+int32   EEFS_NandMount(Vol);                       /* 5.2 steps 2-9 (step 5: EEFS_NandRebuild) */
+void    EEFS_NandMountFinish(Vol);                 /* 5.2 steps 6-8, shared with EEFS_LibRebuildDirectory (declared with 3.4) */
 boolean EEFS_NandHasUncommitted(Vol, boolean IncludeForceDirty);   /* Working != Base (entries, map, batch cleanup entries) */
 extern EEFS_FileDescriptor_t EEFS_FileDescriptorTable[];          /* declared in the internal header for Abort's busy check */
 ```
@@ -814,10 +823,11 @@ boolean EEFS_NandBlockUnchanged(Vol, uint16 OldBlock, uint32 K, uint32 OldCrc, u
         /* 6.3 step 5: TRUE iff OldLen == NewLen, CRC32(NewSlice) == OldCrc and every byte of the old block's data pages for
            position K (read uncached, page by page) equals NewSlice. Any read error -> FALSE. */
 int32   EEFS_NandValidateSlot(Vol, uint32 Entry, uint8 Slot, boolean Full);  /* page 0 (+ all block CRCs when Full); sets/clears SLOTFLAG_CORRUPT; SUCCESS / CORRUPT_FILE / IO_ERROR */
+void    EEFS_NandSlotFailed(Vol, uint32 Entry, uint8 Slot);                  /* the flags of a failed validation (6.4): SLOTFLAG_CORRUPT, and ActiveFailed for the active copy; used by ValidateSlot, CopySlot and the health check */
 int32   EEFS_NandWriteCopy(Vol, uint32 SrcEntry, uint8 SrcSlot, EEFS_NandPage0_t *NewP0, uint16 *DstBlocks);
         /* copies the data of (SrcEntry,SrcSlot) page by page into DstBlocks and writes NewP0 as page 0 of DstBlocks[0]; used by
            CopySlot, Rename, SetAttr. Ordering, verify and retry rules in 7.5; on a grown bad block it replaces that entry of
-           DstBlocks[] in place (hence non-const) and restarts. */
+           DstBlocks[] in place (hence non-const) and restarts. It assigns NewP0->WriteSeq itself. */
 void    EEFS_NandTouch(Vol);                                                 /* VolumeChangeCounter++ */
 ```
 
@@ -855,8 +865,8 @@ int32   EEFS_NandReclaimOrphans(Vol);       /* 8.4 */
 - `VolumeChangeCounter` increments on every call that changes `Working`, `Base`, `SlotFlags`, the
   map or the media (WriteFile, Remove, Rename, SetFileAttributes, CopySlot(+All), SetActiveSlot(+All),
   SetFallbackCompatible(+All), SetFailed, ClearFailed, Commit, Abort, RepairDirectory,
-  RebuildDirectory, ReclaimOrphans, MarkBad, and VerifyFile/Open when they set a flag). As delivered
-  (phase 6), `EEFS_NandProgramPageVerified` and `EEFS_NandEraseBlock` also bump it, so every media change
+  RebuildDirectory, ReclaimOrphans, MarkBad, and VerifyFile/Open when they set a flag).
+  `EEFS_NandProgramPageVerified` and `EEFS_NandEraseBlock` also bump it, so every media change
   (including the pending-cleanup erases at the start of a mutating call and the programs of a write that
   later fails) restarts a running health check, whichever call made it.
 
@@ -919,8 +929,8 @@ PagesPerBlock + 2 x EEFS_MAX_FILES` pages.
    page (FMT 3.4). On success `DirectoryRebuilt = 1`, `LastSeq = max(MaxSeqSeen over both mirrors) + 1`,
    both mirrors `NeedsResync = EnterNewBlock = 1`, `HasState = 0`, no pending cleanup. Nothing is
    written: the first commit (its resync checkpoint, even when the batch is empty) or
-   `EEFS_LibRepairDirectory` persists the rebuilt state. As delivered, steps 6-8 are
-   `EEFS_NandMountFinish` (journal.c), which `EEFS_LibRebuildDirectory` shares.
+   `EEFS_LibRepairDirectory` persists the rebuilt state. Steps 6-8 are `EEFS_NandMountFinish`
+   (journal.c), which `EEFS_LibRebuildDirectory` shares.
 6. **Reconcile.** For each entry `i` in use, each slot `s` in use: `EEFS_NandReadPage0(FirstBlock)`.
    - Invalid (`CORRUPT_FILE`/`IO_ERROR`): `SlotFlags[i][s] |= CORRUPT`. If `s` is the active slot
      of an `IsAB` entry: `ActiveFailed = 1` in `Working` and `Base`, `ForceDirty[i]`. Map bytes
@@ -973,11 +983,12 @@ A page that fails validation and is not erased stops the chain and sets `Torn` e
 followed by erased pages: the mirror will move to a new block (section 5.4) rather than program
 after a possibly half-programmed page.
 
-Ties (as delivered): two blocks of a mirror can carry a checkpoint with the same `Seq` (for example a
-resync checkpoint when the mirror's own chain already ended at that `Seq`). The scan therefore walks
-every candidate whose checkpoint `Seq` equals the best one found and keeps the longest chain (highest
-`LastSeq`), instead of stopping at the first valid candidate. `Torn` is also set when any candidate
-with a `Seq` at least that of the chosen checkpoint has an invalid checkpoint.
+Ties: the writer never puts two checkpoints with the same `Seq` into one mirror (a resync is written
+only to a mirror whose chain ends below `LastSeq`, 5.4). Defensively, the scan walks every candidate
+whose checkpoint `Seq` equals the best one found and keeps the longest chain (highest `LastSeq`),
+instead of stopping at the first valid candidate; the bootloader takes the first valid one in block
+order (FMT 5 step 2). `Torn` is also set when any candidate with a `Seq` at least that of the chosen
+checkpoint has an invalid checkpoint.
 
 ### 5.4 Commit (`EEFS_NandCommit`)
 
@@ -1031,16 +1042,15 @@ loop:
     if ++retries > EEFS_NAND_WRITE_RETRIES or Mirror[M].Disabled: return EEFS_IO_ERROR
 ```
 
-The resync flag rule (as delivered) replaces the first revision's "`NeedsResync = 1` on any failed
-mirror": a mirror is only resynced when it really lags, so a resync never writes a checkpoint whose
-`Seq` equals the mirror's own last record; a failed mirror that does not lag (nothing was committed)
-simply starts a new block with a CHECKPOINT at the next commit. `NeedsResync` also forces a CHECKPOINT
+The resync flag rule: a mirror is only resynced when it really lags, so a resync never writes a
+checkpoint whose `Seq` equals the mirror's own last record; a failed mirror that does not lag (nothing
+was committed) simply starts a new block with a CHECKPOINT at the next commit. `NeedsResync` also forces a CHECKPOINT
 in `EEFS_NandWriteRecordToMirror`, so a mirror whose resync failed is never given a TXN that cannot
 chain onto its records. `EEFS_NandResync` writes `State = Base` with the first `PendingCleanupBase`
 cleanup entries (none at commit time, since the pending cleanup has just run). After a rebuild (5.2 step 5,
 8.3) both mirrors need a resync, and the resync checkpoint of `Base` at `LastSeq` is what persists the
-rebuilt state: as delivered, `EEFS_NandCommit` clears `DirectoryRebuilt` as soon as a mirror holds a record
-at `LastSeq`, so a `Commit` with nothing else to write still persists a rebuilt directory.
+rebuilt state: `EEFS_NandCommit` clears `DirectoryRebuilt` as soon as a mirror holds a record at `LastSeq`,
+so a `Commit` with nothing else to write still persists a rebuilt directory.
 
 `EEFS_NandEnterBlock(M)`: `CurIndex = (CurIndex + 1) % Count` (or 0 if `!HasState`), erase that
 block; on failure `MarkBad` it (the ring shrinks, indexes shift: recompute `CurIndex` to the block
@@ -1054,8 +1064,8 @@ two).
 MAPCHUNKs: for CHECKPOINT the whole map in greedy chunks that fill each page; for TXN the changed
 ranges, where a *range* is a maximal run of changed bytes extended to merge gaps of fewer than 16
 unchanged bytes; then ENTRY items for `EntryMask` bits in index order; then CLEANUP), moving to the
-next page when an encoder returns 0; seal; program with verify (decode the read-back header and
-compare `Seq`, `PageIndex`, `RecType`, CRC). Any failure returns `EEFS_IO_ERROR` immediately. The
+next page when an encoder returns 0; seal; program with verify (a byte compare of the read-back page,
+3.1). Any failure returns `EEFS_IO_ERROR` immediately. The
 dry run (`EEFS_NandRecordPages`) runs the same packing without programming, so `PageCount` is exact.
 
 Crash points: see FMT 8. In addition, a crash inside `MarkBad`'s OOB write is harmless (the map
@@ -1068,9 +1078,9 @@ if any open descriptor refers to (i,s) whose Working slot differs from Base slot
 for each (i,s) with Working.Entry[i].Slot[s].InUse and Working FirstBlock != Base FirstBlock (slot created or rewritten in the batch):
     best effort: erase Working FirstBlock only (its page 0 would otherwise be an orphan); failure -> MarkBad.
     Never touch the other blocks of the slot: with copy-on-write they may be shared with the committed copy.
-    (As delivered: only when FirstBlock is a data block that is FREE in Base and not BAD, and its page 0 is not erased.
-    Phase 3 adds the same erase for the batch's own cleanup-list entries that are FREE in Base and FREEING in Working:
-    first blocks the batch created and then superseded itself.)
+    Only when FirstBlock is a data block that is FREE in Base and not BAD, and its page 0 is not erased.
+for each b on the batch's part of the cleanup list that is FREE in Base and FREEING in Working (a first block the batch
+    created and then superseded itself, e.g. a file rewritten twice): the same erase, so the batch leaves no orphan
 for each b: if Working.Map[b] == BAD: keep; else Working.Map[b] = Base.Map[b]
 Working.Entry[] = Base.Entry[]; Working.WriteSeqHigh = Base.WriteSeqHigh
 PendingCleanupCount = count loaded at mount or left by the last commit that is still pending (i.e. remove entries added during the batch: the list is kept as [mount-pending | batch-added], tracked by PendingCleanupBase index)
@@ -1088,10 +1098,12 @@ Called at the top of **every mutating API** (WriteFile, Remove, Rename, SetFileA
 CopySlot(+All), Commit, RepairDirectory, ReclaimOrphans) when `PendingCleanupBase > 0`, before the
 operation allocates or changes anything: for each of the first `PendingCleanupBase` blocks: if its
 page 0 is not erased, erase it (failure -> `MarkBad`). Then remove them from the list and set
-`PendingCleanupBase = 0`. As delivered, a listed block is only erased if it is a data block whose
-`Working.Map` byte is FREE (as FMT 4.3.4 guarantees for a well-formed record), so a corrupt or stale
-list can never erase a live file. `EEFS_NandAddCleanup` ignores a block that is already listed. The list of a commit is executed inside that commit (5.4), so after a
-clean commit nothing is pending. Mount never runs it.
+`PendingCleanupBase = 0`. A listed block is only erased if it is a data block whose `Working.Map` byte
+is FREE (as FMT 4.3.4 guarantees for a well-formed record), so a corrupt or stale list can never erase a
+live file. `EEFS_NandAddCleanup` ignores a block that is already listed. The list of a commit is
+executed inside that commit (5.4), so after a clean commit nothing is pending; the newest record still
+lists the blocks its cleanup erased, so a remount reloads the list and the next mutating call re-runs
+it, which is a no-op for erased blocks. Mount never runs it.
 
 ## 6. File operations
 
@@ -1102,15 +1114,15 @@ clean commit nothing is pending. Mount never runs it.
 | Caller | `SlotSpec` NONE | `SlotSpec` A/B |
 |---|---|---|
 | Open / Stat / GetFileInfo / VerifyFile | `IsAB ? ActiveSlot : A`. Open applies the fallback rule (7.3); the others never fall back. | that slot (must be in use, else `EEFS_FILE_NOT_FOUND`); never falls back |
-| WriteFile | existing entry: `IsAB ? ActiveSlot : A`, unless `Meta->Slot` is A/B which acts like a suffix; new entry: `Meta->Slot` if A/B (sets `IsAB`), else A with `IsAB = 0` | that slot; sets `IsAB = 1` on the entry |
+| WriteFile | existing entry: `IsAB ? ActiveSlot : A`, unless `Meta->Slot` is A/B which acts like a suffix; new entry: `Meta->Slot` if A/B (sets `IsAB`; a new entry written to B only gets `ActiveSlot = B`), else A with `IsAB = 0` | that slot; sets `IsAB = 1` on the entry |
 | Remove | the whole entry (all slots) | that slot only (6.5) |
 | Rename / SetFileAttributes / SetActiveSlot / SetFallbackCompatible / SetFailed / ClearFailed / CopySlot | the entry | `EEFS_INVALID_ARGUMENT` |
 
 A stored path of 255 characters is the maximum (`strlen < EEFS_NAND_MAX_PATH_SIZE`); the suffix
 is not stored. Paths must begin with `/`; no other validation (the volume is flat: `/cf/apps/x.so`
-is one name and `/cf` is not a directory). As delivered, `@` is reserved: after a trailing `@A`/`@B`
-is removed, a path that still contains `@` is `EEFS_INVALID_ARGUMENT` (this is what "a second `@`"
-means, and it also rejects unknown suffixes such as `@C` or `@a`).
+is one name and `/cf` is not a directory). `@` is reserved: after a trailing `@A`/`@B` is removed, a
+path that still contains `@` is `EEFS_INVALID_ARGUMENT` (this is what "a second `@`" means, and it also
+rejects unknown suffixes such as `@C` or `@a`).
 
 ### 6.2 Copy-on-write rule (user decision, 2026-10-15)
 
@@ -1147,7 +1159,7 @@ reserve rule, 6.9) does not cover the new first block plus the changed blocks, t
  3. Resolve entry i (FindEntry or AllocEntry) and slot s (6.1). Existing entry with READONLY attribute -> EEFS_PERMISSION_DENIED
     (write a new entry instead). Any open descriptor on (i, s) -> EEFS_PERMISSION_DENIED.
  4. Need = EEFS_NandBlocksNeeded(Size). Need > MaxBlocksPerFile (a size no metadata page can describe) -> EEFS_INVALID_ARGUMENT
-    (as delivered, matching the return list of 2.6; a file that merely does not fit the free space is NO_SPACE in step 5).
+    (a file that merely does not fit the free space is NO_SPACE in step 5).
     Mode = slot in use ? MODIFY : NEW. MODIFY needs cleanup room for 1 block (EEFS_NandCleanupHasRoom) else EEFS_TRANSACTION_ERROR.
  5. Build the position table Pos[0..Need-1], each {Block, Kept}:
       NEW:    all positions new.
@@ -1206,7 +1218,11 @@ every block), so a modify of one slot cannot touch the other. Writing the active
 safe (the old copy stays live until the commit), which removes the plan's warning about in-place
 writes to the active copy.
 
-The lock is held for the whole call (a 200 MB write blocks readers for its duration; see risks).
+The lock is held for the whole call (a 200 MB write blocks readers for its duration; see risks). The
+write job keeps its block lists and the old page 0's lists in static scratch arrays sized by
+`EEFS_NAND_MAX_FILE_BLOCKS = (EEFS_NAND_MAX_PAGE_SIZE - 1532) / 6` (about 4.3 KB at the defaults, with two
+page-0 structures), shared by all volumes; this is one reason the lock must be library-wide (section 13).
+Rename, SetFileAttributes and `EEFS_NandWriteCopy` use the same job with a copy source instead of RAM.
 
 ### 6.4 Open and validation
 
@@ -1261,9 +1277,9 @@ Common:
     Touch; AUTO_COMMIT.
 ```
 
-As delivered: `SetFileAttributes` with the value the entry already has returns `EEFS_SUCCESS` and
-writes nothing. A copy-source CRC mismatch is `EEFS_CORRUPT_FILE` (the source slot is flagged), and a
-missing replacement block is reported as `EEFS_IO_ERROR`, as in 7.5.
+`SetFileAttributes` with the value the entry already has returns `EEFS_SUCCESS` and writes nothing. A
+copy-source CRC mismatch is `EEFS_CORRUPT_FILE` (the source slot is flagged), and a missing replacement
+block is reported as `EEFS_IO_ERROR`, as in 7.5.
 
 Power loss: before the commit the old first block is intact and the directory still names it, so
 the file is unchanged; after the commit the new first block is authoritative and the cleanup erase
@@ -1311,7 +1327,9 @@ blocks; which physical blocks are free changes all the time.
 
 "Free" means `Working.Map[b] == FREE` for `b >= DirRegionBlocks`; FREEING blocks do not count
 until the commit, so a batch that removes files does not gain space for itself until it commits
-(this keeps rollback safe). An allocation that would break its class's floor fails with
+(this keeps rollback safe). The allocator only hands out blocks that are FREE in both `Working` and
+`Base`, so a block the committed directory references is never handed out even if the map were
+inconsistent, and it forgets a block it takes from the pending cleanup list. An allocation that would break its class's floor fails with
 `EEFS_NO_SPACE_LEFT_ON_DEVICE` before anything is written or changed. `EEFS_NAND_BADBLOCK_RESERVE
 <= EEFS_NAND_RESERVE_BLOCKS` is enforced at compile time. Both default to small numbers because
 the reserve is also unusable capacity; a volume with many large files that are rewritten often
@@ -1341,6 +1359,17 @@ fallen under `EEFS_NAND_RESERVE_BLOCKS`.
 Per entry: `IsAB`, `ActiveSlot`, `FallbackCompatible`, `ActiveFailed` (FMT 4.3.3), all in the
 directory only; page 0 carries `Slot` and `Version` so a rebuild recovers locations and versions.
 
+`ActiveFailed` is **set** by a failed validation of the active copy (Open, also when it then falls
+back; VerifyFile; mount reconcile; a CopySlot or rewrite whose source page 0 or CRC fails; the health
+check's `AB_ACTIVE_CORRUPT`), all through `EEFS_NandSlotFailed`, and by `SetFailed` (the application
+recording the bootloader's report). The detected kind is recorded in `Base` too (when `Base` holds the
+same slot record) with `ForceDirty`, so Abort keeps it and the next commit persists it. It is
+**cleared** by `ClearFailed`, `SetActiveSlot(+All)` (even to the same slot), a rewrite of the active
+copy and a `CopySlot` into the active slot; a rewrite or copy into the inactive slot does not clear it.
+`FallbackCompatible` is set only by the setters (a rebuild resets it to 0). After an upload and
+activation the two copies normally carry different `Version`s (`AB_VERSION_MISMATCH`, informational);
+after a promote they are equal.
+
 ### 7.2 Setters
 
 - `SetActiveSlot(Name, s)`: entry must be `IsAB` (else `INVALID_ARGUMENT`), `Slot[s].InUse` (else
@@ -1352,9 +1381,9 @@ directory only; page 0 carries `Slot` and `Version` so a rebuild recovers locati
   stored as 1). Returns count for All.
 - `SetFailed(Name)` / `ClearFailed(Name)`: `IsAB` required; set/clear `ActiveFailed`. `SetFailed`
   is what the application calls after the bootloader reported `ActiveFailed` through the boot-info
-  handoff. All of these write `Working` only and need a commit. As delivered: the volume must not be
-  write-protected (`EEFS_READ_ONLY_FILE_SYSTEM`); `READONLY` files are not refused (the flags are directory
-  metadata, not file content); setting a value an entry already has still counts for the `All` variants, and
+  handoff. All of these write `Working` only and need a commit. The volume must not be write-protected
+  (`EEFS_READ_ONLY_FILE_SYSTEM`); `READONLY` files are not refused (the flags are directory metadata, not
+  file content); setting a value an entry already has still counts for the `All` variants, and
   `SetActiveSlot` to the slot that is already active still clears `ActiveFailed`.
 
 ### 7.3 Open resolution with fallback
@@ -1409,9 +1438,8 @@ destination erase/program/verify failure: `MarkBad`, allocate one replacement bl
 position with `ALLOC_REPLACE` (`NO_SPACE` -> `EEFS_IO_ERROR`), rebuild `NewP0` (`Blocks[]` changed) and restart the
 copy, up to `EEFS_NAND_WRITE_RETRIES` times. The destination page 0 is encoded into `PageBuf` and
 written last. On every failure, including a source page 0 that no longer reads before anything was
-written, the destination blocks that are still owned are released (as delivered in phase 5; phase 3 left
-them allocated in that early case). The copy goes page by page through the HAL; a BSP with a hardware block buffer may
-optimize inside its `ProgramPage`.
+written, the destination blocks that are still owned are released. The copy goes page by page through
+the HAL; a BSP with a hardware block buffer may optimize inside its `ProgramPage`.
 
 ## 8. Rebuild, repair, orphans
 
@@ -1440,7 +1468,7 @@ The scratch table (64 x (256 + 2 x 8) ~ 17 KB) is **built inside `Base.Entry[]`*
 unused during the rebuild, to avoid extra static RAM; pass 2 then writes `Working` and finally
 copies to `Base`.
 
-As delivered:
+Rules of the implementation, refining the pseudo-code above:
 
 - **Bad-block markers** are read with `EEFS_NandHasBadMarker` (every `BadMarkerPages` page, as at
   format), not only from the OOB of page 0.
@@ -1450,8 +1478,7 @@ As delivered:
   Ties in pass 2 (equal `WriteSeq`, which only a crafted image has) go to the lower first block.
 - **`EEFS_NOT_FORMATTED`** is returned only when the data region holds no valid metadata page at all
   (FMT 3.4), matching the user requirement and the bootloader's scan. A device whose only metadata
-  pages fail the first-block CRC mounts with an empty rebuilt directory. (The first revision said
-  "no row", which would also have refused such a device.)
+  pages fail the first-block CRC mounts with an empty rebuilt directory.
 - **`IsAB`** is set from the accepted winners only (a discarded explicit-slot winner does not make
   the entry A/B).
 - A winner that lists a block whose map value is BAD (a bad-block marker) is accepted; the block
@@ -1477,7 +1504,7 @@ Requires no open files/dir (`DEVICE_IS_BUSY`), `Working == Base` apart from `For
 (`TRANSACTION_ERROR`), no active health check. Re-runs mount steps 2, 5 (rebuild), 6, 7, 8 on the
 mounted volume. Use: a directory that mounted but is believed wrong.
 
-As delivered: a pending cleanup loaded from the media is run first (so a committed removal whose
+Details: a pending cleanup loaded from the media is run first (so a committed removal whose
 cleanup erase was cut does not come back); step 2 is not re-run (the directory-region map, with its
 bad blocks, and the mirror rings in RAM are current; data-region BAD marks are kept too). `LastSeq` =
 `max(LastSeq, MaxSeqSeen of both mirrors) + 1`; the mirrors keep their state but get `NeedsResync =
@@ -1489,18 +1516,15 @@ health summary is kept) and the code is returned; if that mount fails too, the v
 
 ### 8.4 `EEFS_LibReclaimOrphans`
 
-`RunPendingCleanup`. For each `b` in `[DirRegionBlocks, BlockCount)` with `Working.Map[b] ==
-FREE`: read page 0; if it is a valid metadata page (any content), erase `b` (failure ->
-`MarkBad`). Blocks that are owned (including by uncommitted batch slots) or FREEING are never
-touched, so a batch in progress is safe. Returns the number erased. Reads `BlockCount -
-DirRegionBlocks` pages and holds the lock throughout.
-
-As delivered (phase 6): a block is erased only if it is FREE in both `Working` and `Base` (as the allocator
-requires), is not on the pending cleanup list (either part), and `EEFS_NandReadPage0` validates its page 0
-(FMT 3.4 with `ExpectBlock = b`; a factory-bad block fails the read and is skipped). A failed erase marks the
-block bad and is not counted, so `EEFS_IO_ERROR` is never returned; `EEFS_READ_ONLY_FILE_SYSTEM` is returned
-when `EEFS_LIB_IS_WRITE_PROTECTED`. The volume is touched only when something was erased. The internal
-`EEFS_NandReclaimOrphans` does the work under the caller's lock.
+`RunPendingCleanup`. For each `b` in `[DirRegionBlocks, BlockCount)` that is FREE in both `Working`
+and `Base` (as the allocator requires) and is not on the pending cleanup list (either part): read page
+0; if `EEFS_NandReadPage0` validates it (FMT 3.4 with `ExpectBlock = b`, any content; a factory-bad
+block fails the read and is skipped), erase `b`. Blocks that are owned (including by uncommitted batch
+slots) or FREEING are never touched, so a batch in progress is safe. Returns the number erased; a
+failed erase marks the block bad and is not counted, so `EEFS_IO_ERROR` is never returned;
+`EEFS_READ_ONLY_FILE_SYSTEM` when `EEFS_LIB_IS_WRITE_PROTECTED`. Reads `BlockCount - DirRegionBlocks`
+pages at most and holds the lock throughout. The volume is touched only when something was erased. The
+internal `EEFS_NandReclaimOrphans` does the work under the caller's lock.
 
 ## 9. Bootloader library (`libraries/microeefs_nand`)
 
@@ -1540,7 +1564,7 @@ scan found no metadata page at all). Page reads: `DirRegionBlocks + 2 x 2 x Page
 (two passes over at most two chains) + 1 for page 0 + 1 per data page loaded (full pages are read
 straight into the destination and only the file's last, partial page goes through `PageBuffer`, so page 0
 is never re-read); scan fallback adds `BlockCount - DirRegionBlocks`, plus the first block's data pages of
-each page 0 of the name that would win (the first-block CRC check of FMT 7.2 step 3, added in phase 4).
+each page 0 of the name that would win (the first-block CRC check of FMT 7.2 step 3).
 
 Candidate tracking: one `EEFS_NandEntry_t` (328 bytes) plus its index; `MAPCHUNK` and `CLEANUP`
 items are skipped by length. A checkpoint resets the candidate before its items are applied.
@@ -1617,7 +1641,7 @@ typedef struct EEFS_HealthReport {
     uint32  Page, Block, DataOffset;
     uint32  RunBlockCrc, RunFileCrc, MaxCorrectedInBlock;
     uint32  ExpectBlockCrc;
-    /* added in phase 6: every cursor of the resumable check */
+    /* every cursor of the resumable check */
     uint32  StepReads;                                   /* page reads in the current step */
     uint8   Marker, Verdict, FirstActive, Reserved;      /* bad-marker page cursor; phase 2 slot verdict; phase 3 LOAD_MIXED state */
     uint32  K, FirstBlock, BlockCount, FileSize, FileCrc32;           /* phase 2: Blocks[] index and the slot's page 0 */
@@ -1632,7 +1656,7 @@ typedef struct EEFS_HealthReport {
     EEFS_NandChain_t Chain[2];
     uint8   FailedAtStart[(EEFS_MAX_FILES + 7) / 8];     /* ActiveFailed when the check (re)started */
     uint8   SetByCheck[(EEFS_MAX_FILES + 7) / 8];        /* ActiveFailed set by this check (kept across restarts) */
-    uint8   Claimed[EEFS_NAND_MAX_BLOCKS / 8];           /* blocks claimed by a validated page 0 */
+    uint8   Claimed[(EEFS_NAND_MAX_BLOCKS + 7) / 8];     /* blocks claimed by a validated page 0 */
     uint8   SlotResult[EEFS_MAX_FILES][2];               /* 0 unchecked, 1 ok, 2 corrupt, 3 io error, 4 not in use */
 } EEFS_HealthReport_t;                               /* ~3.5 KB at the defaults */
 ```
@@ -1656,6 +1680,11 @@ typedef struct EEFS_HealthReport {
 - The check **never writes NAND**. Its only side effects on RAM are `SLOTFLAG_CORRUPT` and
   `ActiveFailed` (6.4 semantics) when a slot fails in phase 2, which do *not* bump
   `VolumeChangeCounter` from inside the check (to avoid self-restart).
+- `Cancel(T)` detaches the report (`SUCCESS` also when none is attached). `Start` on an unmounted volume
+  is `INVALID_ARGUMENT`. The report memory (~3.5 KB) is the caller's and must stay untouched while it is
+  attached; `S` may be read between steps (a snapshot carries `INCOMPLETE`).
+- Deployment: an application with several tasks runs the check in a low-priority task with a small
+  `MaxPageReads` and a sleep between steps, and needs a real library lock (section 13).
 
 ### 10.3 Phases and exact conditions
 
@@ -1727,7 +1756,9 @@ table.
 Cost: phase 1 <= `DirRegionBlocks + 4 x PagesPerBlock`; phase 2 = every data page of every slot +
 `BlockCount` page-0 re-reads at most; phase 4 = `BlockCount - DirRegionBlocks`.
 
-### 10.4 As delivered (phase 6)
+### 10.4 Implementation rules
+
+These refine 10.3; where they are more specific, they are the rule.
 
 Structure. Every unit of work reads at most one page, uncached, into `Vol->PageBuf` (or the OOB into
 `Vol->OobBuf`), finishes with it and keeps everything it needs in the report, so a step can end after any read
@@ -1790,8 +1821,8 @@ the page's path, no entry.
 Summary bits are accumulated as findings are added, also for findings that no longer fit (`Overflow` counts those,
 duplicates of a dropped finding included). `FREE_BELOW_RESERVE` carries no slot, entry or block.
 
-Cancel returns `EEFS_SUCCESS` whether or not a check was attached. `Start` on an unmounted volume is
-`EEFS_INVALID_ARGUMENT`. The driver gained `EEFS_HealthCheckCancel(MountPoint)`.
+Cancel and the unmounted-volume rule are in 10.2. The test suite computes the `PagesRead` of a clean volume
+exactly from these rules (`H_ExpectedReads` in `tests/nand/test_health.c`).
 
 ## 11. Simulator (`tests/nand/nand_sim.[ch]`)
 
@@ -1843,11 +1874,12 @@ uint32 NandSim_Violations(const NandSim_t *Sim);
 NULL` returns `EEFS_NAND_READ_UNCORRECTABLE` (its data is garbage), with `Data == NULL` returns 0
 (raw OOB) so the marker scan works. Erased pages return 0 and all `0xFF`.
 
-Additions made in phase 1 (see `tests/nand/nand_sim.h` for the full contract): `NandSim_Ops()`,
+Also (see `tests/nand/nand_sim.h` for the full contract): `NandSim_Ops()`,
 `NandSim_RawRead`, `NandSim_PageIsProgrammed`, the `NANDSIM_ANY` wildcard (block or page) for injections; counters count
 calls including failed ones; `ResetCounters` also clears `Violations`; an OOB-only program (the bad-block marker) is
 exempt from the strict page rules; `TORN_GARBAGE` applied to an erase XORs every byte of the block with `0xA5` (the
-block is left neither erased nor intact); `RawErase` also clears a factory-bad mark.
+block is left neither erased nor intact, and its OOB marker byte is no longer `0xFF`, which the health check reports as
+`BADBLOCK_UNRECORDED` until the block is erased again); `RawErase` also clears a factory-bad mark.
 
 Power-cut sweeps are written as: for `cut = 1 ..` `{ fresh sim from a saved image (NandSim_Clone
 copies the content); SetPowerBudget(cut, mode); run the operation; if !PowerCutHappened break;
@@ -1872,31 +1904,64 @@ added to the API for that purpose, and run for `TornMode` NONE, PARTIAL and GARB
 
 Every public function takes `EEFS_LIB_LOCK` on entry and releases on exit, as the EEPROM backend
 does, including the long ones (WriteFile, CopySlot, Rename, Commit, ReclaimOrphans). The health
-check holds it only inside `Step`.
+check holds it only inside `Step`. Every HAL call is made under the lock.
 
-As delivered (phase 6): the standalone driver's `eefs_macros.h` leaves `EEFS_LIB_LOCK` empty (single-task use)
-unless `EEFS_LIB_LOCK_HOOKS` is defined, in which case the macros call `EEFS_LibLockHook()` and
-`EEFS_LibUnlockHook()`, which the application provides; they must implement one library-wide recursive mutex
-(on RTEMS a binary semaphore with priority inheritance). The RTEMS NAND test builds its own copy of the library
-with the hooks (`eefs_rtems_locked` in `tests/rtems/CMakeLists.txt`); the `eefs` target is unchanged. The descriptor table and the single directory descriptor are
-shared across volumes exactly as in the EEPROM backend (same globals, same helper functions
-re-implemented in `eefs_nand_fileapi.c`).
+The lock is **one library-wide recursive mutex**, not one per volume: the descriptor table and the
+single directory descriptor are shared across volumes exactly as in the EEPROM backend (same globals,
+same helper functions re-implemented in `eefs_nand_fileapi.c`), and so are the write job's static
+scratch arrays (6.3).
+
+The standalone driver's `eefs_macros.h` leaves `EEFS_LIB_LOCK` empty (single-task use) unless
+`EEFS_LIB_LOCK_HOOKS` is defined, in which case the macros call `EEFS_LibLockHook()` and
+`EEFS_LibUnlockHook()`. The CMake option `EEFS_LOCK` selects the lock for both backends:
+
+| `EEFS_LOCK` | Definitions (PUBLIC on `eefs`) | Lock | Valid for |
+|---|---|---|---|
+| `none` (default) | none | empty macros; one task only. The build is unchanged from before the option existed. | any |
+| `hooks` | `EEFS_LIB_LOCK_HOOKS` | the application implements the two hooks as one recursive mutex | `EEFS_DRIVER=standalone` |
+| `rtems` | `EEFS_LIB_LOCK_HOOKS`, `EEFS_LIB_LOCK_RTEMS` | `drivers/standalone_driver/eefs_rtems_lock.c`, compiled into `eefs` | `EEFS_DRIVER=standalone`, RTEMS targets (`cmake/rtems-toolchain.cmake`) |
+
+Configure errors: an unknown value; `hooks` or `rtems` with another driver (its `eefs_macros.h` has its own lock);
+`rtems` without an RTEMS toolchain. A custom `EEFS_MACROS_DIR` with `hooks`/`rtems` gives a warning: its
+`eefs_macros.h` must route the macros to the hooks the same way.
+
+**The RTEMS lock** (`EEFS_LOCK=rtems`) is an RTEMS self-contained recursive mutex (`rtems_recursive_mutex`,
+`<rtems/thread.h>`, RTEMS 6/7), which uses the priority inheritance protocol. It is **statically initialized**
+(`RTEMS_RECURSIVE_MUTEX_INITIALIZER("EEFS")`), so it is neither created by an init function nor lazily: there is
+nothing to call before the first EEFS call, no creation failure, no race between tasks making their first call at
+the same time, and no Classic API semaphore to add to `CONFIGURE_MAXIMUM_SEMAPHORES`. It may be used from any task,
+not from interrupt context (nor may the library). `EEFS_RtemsLockWaits()` (`eefs_rtems_lock.h`, installed with the
+option) counts the times a task had to wait for the lock, counted under the lock. Priority inheritance matters for
+the intended deployment: a writer at high priority that waits for a background health check step lends the
+check's task its priority until the step ends.
+
+Tests: the RTEMS NAND test always runs on this lock: with `EEFS_LOCK=rtems` it links `eefs` itself, otherwise a
+test-private copy of the library built the same way (`eefs_rtems_locked` in `tests/rtems/CMakeLists.txt`), so the
+`eefs` target keeps the configured lock. It checks that each interrupted write waited exactly once
+(`EEFS_RtemsLockWaits`) and that the health task ran at the writer's priority meanwhile
+(`rtems_task_get_priority`). With `EEFS_LOCK=hooks`, the host test runner (`tests/nand/nand_test_main.c`, through
+`eefs_nand_test_default`) supplies counting hooks and fails a case that leaves the lock held, and the EEPROM RTEMS
+test supplies hooks and checks the lock is released at the end. During phase 8 every suite was run that way at the
+4096/224/128 geometry (`eefs_nand_test_default <suite> ...`), with the lock balanced on every path.
 
 ## 14. Phased delivery
 
-Phases are implemented sequentially by different engineers; each phase leaves the tree building
-(`cmake -B build -G Ninja && cmake --build build && ctest --test-dir build --output-on-failure`
-for both `-DEEFS_BACKEND=eeprom` and `-DEEFS_BACKEND=nand`, and the RTEMS configure/build from
-`CLAUDE.md` for `eeprom`) with every registered test passing. "Done" always includes a
-warning-free build with the project flags on clang and `arm-rtems7-gcc`.
+The backend was delivered in eight phases (1, then 2 and 7 in parallel, 3, then 4 and 5 in parallel, 6, 8),
+each leaving the tree building with every registered test passing and a warning-free build with the project flags
+on clang and `arm-rtems7-gcc`. This section records what each phase implemented and the tests it added; all of
+them are registered today. The behaviour they settled is in sections 2-13; section 17 has the history.
 
-Parallelism: **1** first. Then **2 -> 3** strictly sequential. **7** (bootloader) may start right
-after 1, in parallel with 2 and 3, because it depends only on `eefs_nand_format.[ch]`, the CRC, the
-simulator and FMT; its tests build volumes with the encoders until 3 lands, then add the
-integration cases. **4** and **5** may run in parallel after 3 (4 touches
-`eefs_nand_rebuild.c` and the mount step 5 branch in `eefs_nand_journal.c`; 5 touches only
-`eefs_nand_fileapi.c` and the driver; agree on who edits `eefs_nand_internal.h`). **6** after 5.
-**8** last.
+Test matrix (commands in `CLAUDE.md`; always with `--clean-first`, ctest run serially):
+
+| Configuration | Tests | Time |
+|---|---|---|
+| Host, `EEFS_BACKEND=eeprom` | 4 golden-image tests | seconds |
+| Host, `EEFS_BACKEND=nand` | 30: nine suites x three geometries, `nand_default_config_4096`, `nand_verify_on_open_4096`, `nand_verify_on_open_ab_4096` | about 6 minutes (the power-cut sweeps) |
+| RTEMS QEMU (arm `xilinx_zynq_a9_qemu`), eeprom | `eefs_rtems_qemu` (golden image) | about 1 s |
+| RTEMS QEMU, nand (any `EEFS_LOCK`) | `eefs_rtems_qemu` (the end-to-end test of phase 8) | about 2 s (limit 60 s) |
+
+`EEFS_LOCK=rtems` is exercised by the RTEMS configurations configured with it; `EEFS_LOCK=hooks` by a host build
+running `nand_default_config_4096` (section 13).
 
 ### Phase 1: backend split, CMake, HAL, CRC, format module, simulator
 
@@ -1939,8 +2004,8 @@ mount-point resolution, `EEFS_Format` device handling); later phases only implem
 plus the `EEFS_UnMount` commit (phase 3). `MicroEEFS_NandSetSlotHook` already stores the hook. The `layout` suite
 also has `block_data_range` (FMT 3.3 ranges) and `capacity_table` (the FMT 4.6 page counts, packed with the encoders
 the way 5.4 describes). `eefs_nand_test_default` is built from phase 1 on and registered in phase 3. The phase 1
-`eefs_rtems_nand_test.c` checks the CRC, the simulator and a page 0 round trip on the target and expects
-`EEFS_Format` to return `EEFS_UNSUPPORTED_OPTION`; phase 2 must update that expectation.
+`eefs_rtems_nand_test.c` checked the CRC, the simulator and a page 0 round trip on the target; later phases
+extended it and phase 8 replaced it.
 
 ### Phase 2: journaled directory
 
@@ -2010,9 +2075,7 @@ skipped by the ring), `powercut_sweep_commit_with_resync` (mirror 1 one record b
 `powercut_sweep_pending_cleanup_then_commit`, `powercut_sweep_repair_directory`, `powercut_sweep_format` (on a
 64-block device that holds a volume), and two double-fault sweeps (`powercut_double_sweep_commit`,
 `powercut_double_sweep_enters_block`) that also cut the recovery commit at every point. The RTEMS NAND test formats
-and mounts through the driver, then commits, unmounts and remounts through the library. `EEFS_LibGetVolumeInfo` and
-the `EEFS_GetVolumeInfo` wrapper exist and return `EEFS_UNSUPPORTED_OPTION` until phase 3; mount sets
-`AllocCursor = DirRegionBlocks` until the phase 3 allocator seeds it.
+and mounts through the driver, then commits, unmounts and remounts through the library.
 
 ### Phase 3: file operations
 
@@ -2106,29 +2169,9 @@ exactly the pre or the post directory (monotonic in the cut point), reads every 
 back byte for byte, checks that no metadata page on the device lists a position >= 1 with bad data,
 then does a follow-up write and commit and checks the cleanup, both mirrors and the files again. The
 NAND test programs are compiled with `-O2` when no `CMAKE_BUILD_TYPE` is set (the sweeps run about
-ten thousand mounts per geometry). Implementation notes for later phases:
-
-- The write job keeps its block lists in static scratch arrays sized by
-  `EEFS_NAND_MAX_FILE_BLOCKS` = `(EEFS_NAND_MAX_PAGE_SIZE - 1532) / 6` (about 4.3 KB at the defaults,
-  with two page-0 structures), shared by all volumes under `EEFS_LIB_LOCK`, which must therefore be
-  one library-wide lock (it already guards the shared descriptor table).
-- `EEFS_NandWriteCopy` is implemented for phase 5 (whole-slot copy with per-block source CRC checks;
-  it assigns `NewP0->WriteSeq` itself; `DstBlocks[]` must already be allocated for the destination).
-  Rename and SetFileAttributes use the same write job with every position except 0 kept.
-- `EEFS_NandValidateSlot` failures set `SLOTFLAG_CORRUPT` and, for the active copy of an A/B entry,
-  `ActiveFailed` in `Working` (and in `Base` when `Base` holds the same slot record) with `ForceDirty`.
-  Open does not fall back yet (phase 5).
-- A new entry written to slot B only gets `ActiveSlot = B`.
-- The allocator only takes blocks that are FREE in both `Working` and `Base`, so a block the committed
-  directory references is never handed out even if the map were inconsistent.
-- Abort also erases the first blocks the batch created and then superseded itself (they are on the
-  batch's cleanup list and FREE in `Base`), so a batch that rewrote a file twice leaves no orphan.
-- `EEFS_Crc32Update2` (CRC module) feeds the same bytes into a block CRC and a file CRC in one pass;
-  WriteFile and ValidateSlot use it.
-- The byte compare of a kept candidate reads the old block's data pages (`EEFS_NandBlockUnchanged`
-  semantics); WriteFile matches length and CRC first and does not recompute the CRC for the compare.
-- After a commit, the newest record still lists the blocks its cleanup erased; a remount reloads that
-  list and the next mutating call re-runs it, which is a no-op for erased blocks (FMT 4.3.4).
+ten thousand mounts per geometry). The rules this phase settled (the static write job, `EEFS_Crc32Update2`, the
+allocator taking only blocks free in `Working` and `Base`, Abort erasing self-superseded first blocks, the re-run of
+a reloaded cleanup list) are in sections 2.4, 5.5, 5.6, 6.3 and 6.9.
 
 ### Phase 4: rebuild
 
@@ -2207,28 +2250,12 @@ VerifyFile is what detects them). The sweeps cut every program and erase of the 
 `SetFallbackCompatibleAll(1)` + Commit, of `CopySlotAll(B, A)` + `SetActiveSlotAll(A)` + Commit, and of the
 rollback commit, in all three torn modes; after each cut the directory is exactly pre or post, every copy reads
 back exactly under its `@A`/`@B` name, and every file boots its active load through `microeefs_nand` with no
-fallback. `ab_rebuild_recovers_locations_versions` checks the bootloader scan now and the library rebuild once
-phase 4 is merged (it detects the phase 4 stub of `EEFS_LibRebuildDirectory`; after the merge it is strict).
+fallback. `ab_rebuild_recovers_locations_versions` checks both the bootloader scan and the library rebuild.
 Mutations run and reverted: Open ignoring `FallbackCompatible`, CopySlot freeing its new blocks (`FreeSlot`),
 CopySlot sharing the source's data blocks, CopySlot with `ALLOC_MODIFY`, and SetActiveSlot keeping
-`ActiveFailed`; each made at least one `ab` case fail. Notes for phase 6:
-
-- `ActiveFailed` is set by a failed validation of the active copy (Open, including when it then falls back;
-  VerifyFile; mount reconcile; a CopySlot or rewrite whose source page 0 or CRC fails) and by `SetFailed`. The
-  first kind is recorded in `Base` too (when `Base` holds the same slot record) with `ForceDirty`, so Abort keeps
-  it and the next commit persists it. It is cleared by `ClearFailed`, `SetActiveSlot(+All)` (even to the same
-  slot), a rewrite of the active copy and a `CopySlot` into the active slot. A rewrite or copy into the inactive
-  slot does not clear it. The health check's `AB_ACTIVE_CORRUPT` finding (`health_ab_active_corrupt_sets_flag`)
-  should set it through the same path (`EEFS_NandValidateSlot`).
-- CopySlot never shares blocks: after `CopySlot(B, A)` the old A copy's data blocks are FREEING (FREE after the
-  commit) and its first block is on the cleanup list, as for Remove. Until that cleanup erase runs, the old
-  page 0 lists blocks that may already be free or reallocated; like a superseded copy-on-write page 0 it must be
-  reported as `DIR_CLEANUP_PENDING` only, not as an orphan or cross-link.
-- After an upload and activation the two slots normally carry different `Version`s (B being tested); after a
-  promote they are equal. `FallbackCompatible` is set only by the setters (rebuild resets it to 0).
-- A descriptor opened by the fallback has `Fallback = 1` and `Slot` = the inactive slot.
-- `test_ab.c` has static helpers for A/B fixtures and faults (`A_MakeF`, `A_CorruptPage0`, `A_CorruptData`,
-  `A_InjectEcc`, `A_CheckBoot`) that the health tests can copy.
+`ActiveFailed`; each made at least one `ab` case fail. The `ActiveFailed` and `FallbackCompatible` rules are in 7.1;
+`test_ab.c` has static helpers for A/B fixtures and faults (`A_MakeF`, `A_CorruptPage0`, `A_CorruptData`,
+`A_InjectEcc`, `A_CheckBoot`).
 
 ### Phase 6: health check and ReclaimOrphans
 
@@ -2287,26 +2314,13 @@ from the raw media: an orphan for every unclaimed, unlisted valid metadata page 
 the marker bytes a GARBAGE-torn erase leaves in the OOB, `DIR_MIRROR_MISMATCH` when the mirrors' chains end at
 different `Seq`, a torn-tail finding for exactly the mirrors whose scan is `Torn`, and nothing else; then
 ReclaimOrphans erases exactly the orphans, and after a follow-up commit only the torn-erase markers remain. The
-RTEMS NAND test runs the check in a priority-200 task with `MaxPageReads` 4 and a one-tick sleep between steps
-while a priority-50 task writes and commits three files; a HAL wrapper releases the writer from inside the health
-task's page reads, so every write waits for the lock once (priority inheritance), the check restarts three times
-and ends with the expected two findings for a decayed inactive copy.
+RTEMS NAND test gained the background check next to a writer (now part of the phase 8 test).
 
 Mutations run and reverted (each failed at least one `health` case): pending-cleanup blocks reported as
 orphans; only the media part of the cleanup list excluded from the orphan scan; no restart on a volume change;
 a failed active copy not setting `ActiveFailed`; the check's own flagging restarting it; page reads not counted
 against `MaxPageReads`; ReclaimOrphans erasing FREEING blocks, ignoring the cleanup list, or erasing any free
 block.
-
-Notes for phase 8:
-
-- The health check runs for real only with a lock: an application with several tasks must define
-  `EEFS_LIB_LOCK_HOOKS` (or its own `eefs_macros.h`); `tests/rtems/eefs_rtems_nand_test.c` shows the hooks and the
-  RTEMS configuration (3 tasks, 3 semaphores, 1 ms tick).
-- The report memory (`EEFS_HealthReport_t`, ~3.5 KB) is the caller's and must stay untouched while attached.
-- After a power cut in the GARBAGE torn mode of the simulator, an interrupted erase leaves non-0xFF bytes in the
-  OOB marker position, which the check reports as `BADBLOCK_UNRECORDED` until the block is erased again.
-- `PagesRead` of a clean volume is computed exactly by `H_ExpectedReads` in `test_health.c` (section 10.4 rules).
 
 ### Phase 7: bootloader library
 
@@ -2324,26 +2338,37 @@ though an older valid copy exists on the device), `micro_ab_active_and_explicit_
 `micro_ab_no_fallback_when_incompatible` (`CORRUPT_FILE`, `ActiveFailed = 1`),
 `micro_hook_override_honoured_and_compatible_rule_applies`, `micro_torn_txn_ignored`,
 `micro_picks_longest_mirror_chain`, `micro_maxsize_too_small`, `micro_geometry_mismatch`.
-Until phase 3 lands, the fixtures are built with the encoders + simulator raw writes; afterwards
-the cases are re-pointed at volumes produced by the library (`micro_matches_library_state`).
+The fixtures are built with the encoders and simulator raw writes (`tests/nand/nand_fixture.c`), independently of
+the library; `micro_matches_library_state` (added with phase 3) checks volumes produced by the library.
 
 Done when: `nand_micro_*` passes; `microeefs` for NAND builds for `arm-rtems7` with no warnings.
 
-### Phase 8: RTEMS QEMU test and docs
+### Phase 8: RTEMS integration, the RTEMS lock, documentation
 
-Implements: `tests/rtems/eefs_rtems_nand_test.c` (simulator in RAM at 4096/224/128 with 256
-blocks; Format, mount, write 5 files of different types in one batch + Commit, read back, Stat,
-GetFileInfo, A/B upload/activate/commit, `MicroEEFS_NandLoadFile` of a BOOT_ELF typed file,
-health check to completion with `OK`; prints `EEFS RTEMS TEST PASSED`), `tests/rtems/CMakeLists.txt`
-registration for the NAND backend (`eefs_rtems_qemu` runs whichever backend is configured), README
-and CLAUDE.md sections for the NAND backend (build lines for both backends, test matrix, the format
-doc pointer), final pass over `docs/nand-format.md` for anything the implementation changed.
+Implements: the `EEFS_LOCK` option and the EEFS-provided RTEMS lock (section 13); the RTEMS end-to-end test; README
+and CLAUDE.md sections for the NAND backend; a consistency pass over both specs (the "as delivered" notes folded
+into sections 2-13, every finding code, error code and configuration macro cross-checked against the headers, and
+the changelog of section 17).
 
-Done when: `cmake -B build-rtems-nand -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/rtems-toolchain.cmake
--DRTEMS_PREFIX=$HOME/rtems/7 -DRTEMS_VERSION=7 -DRTEMS_ARCH=arm -DRTEMS_BSP=xilinx_zynq_a9_qemu
--DEEFS_BACKEND=nand && cmake --build build-rtems-nand && ctest --test-dir build-rtems-nand
---output-on-failure` passes, and the same for the default backend, and the full host matrix passes
-for both backends.
+`tests/rtems/eefs_rtems_nand_test.c` runs the user's workflow at the target geometry (simulator, 4096/224/128, 256
+blocks), with "power cycles" that clear every RAM state of the driver and the library: format and mount; boot load
+v1 (BOOT_FIT, BOOT_ELF with entry override, BOOT_DTB with their destination addresses, CFS_APP with entry symbol,
+priority and stack size, CFS_LIB) written to slot A and committed (invisible to the bootloader before the commit);
+v2 uploaded to B, activated and marked compatible in one commit (exactly one directory record); the bootloader
+loads the active load byte for byte with its type fields; a decayed data page of B's kernel makes the bootloader
+fall back to A with `ActiveFailed`; at power-on the application records it (`SetFailed`, commit) and runs the
+health check in a priority-200 task (4 reads per step, one tick between steps) while a priority-50 task writes and
+commits three log files from inside the check's page reads: each write waits for the lock once, the health task runs
+at priority 50 meanwhile (priority inheritance), the check restarts three times and reports exactly
+`FILE_CORRUPT` (block CRC), `AB_B_CORRUPT`, `AB_ACTIVE_CORRUPT`, `AB_FAILED_FLAG_SET` and five informational
+`AB_VERSION_MISMATCH`; `CopySlotAll(A, B)` + `SetActiveSlotAll(A)` repair and roll back in one commit and the
+bootloader loads v1 from both slots; v2 is uploaded again, boots cleanly from B and is promoted with
+`CopySlotAll(B, A)`; after a final power cycle and mount the health check is clean, `ReclaimOrphans` finds nothing
+and the simulator saw no NAND rule violation. It takes about 2 s under QEMU.
+
+Done when: the full host matrix passes for both backends, `eefs_rtems_qemu` passes for both backends and for
+`EEFS_LOCK=rtems`, and the libraries of both backends cross-compile without warnings for `arm-rtems7`
+(`xilinx_zynq_a9_qemu`), `i386-rtems7` (`pc386`) and `riscv-rtems7` (`esp32c3db`).
 
 ## 15. Deviations from the approved plan
 
@@ -2379,7 +2404,8 @@ for both backends.
    `EEFS_NAND_BADBLOCK_RESERVE`, `EEFS_NAND_WRITESEQ_MOUNT_GAP`, `EEFS_NAND_MAX_DIR_BLOCKS`,
    `EEFS_NAND_LAYOUT_VERSION`, `EEFS_NAND_HEALTH_PATH_SIZE`, `EEFS_NAND_WRITE_RETRIES`; API
    `EEFS_LibHealthCheckCancel`, `EEFS_LibSetFallbackCompatibleAll`, `EEFS_LibRebuildDirectory` as a
-   public call, `EEFS_LibGetVolumeInfo`. Finding 31 (`DIR_PAGE0_STALE`) existed in the first
+   public call, `EEFS_LibGetVolumeInfo`, the driver's `EEFS_HealthCheckCancel`; the CMake option `EEFS_LOCK` with the
+   EEFS-provided RTEMS lock (section 13). Finding 31 (`DIR_PAGE0_STALE`) existed in the first
    revision of this spec and in the phase 1 header and is retired (see 24).
 9. **Open checks page 0 only by default** (`EEFS_NAND_VERIFY_ON_OPEN = 0`, user decision
    2026-10-15). The first revision defaulted to a full CRC check at open to catch an interrupted
@@ -2448,7 +2474,7 @@ Decisions of 2026-10-15 (user), superseding earlier text of this spec and of the
     blocks would lose a page each. The format keeps `Blocks[]` and header-less data blocks (FMT 3.3).
 26. **`EEFS_NAND_VERIFY_ON_OPEN` defaults to 0** (see 9) and the **RAM budget is accepted** (see 19).
 
-## 16. Open risks and questions
+## 16. Open risks and known limitations
 
 - **Lock duration.** WriteFile, CopySlot, Rename, SetAttr and ReclaimOrphans hold the single
   library lock for their whole duration (hundreds of ms to seconds for large files), blocking all
@@ -2473,3 +2499,51 @@ Decisions of 2026-10-15 (user), superseding earlier text of this spec and of the
   before commit is the *uncommitted* copy when both are complete (the same documented caveat as
   for a new file in an uncommitted batch).
 - **Signature scheme** left for the future; version 1 readers reject `SigType != 0`.
+- **No POSIX file system.** As for the EEPROM backend, applications use the standalone driver API
+  (`EEFS_InitFS`, `EEFS_Mount`, `EEFS_WriteFile`, ...); the RTEMS 4.10 `rtems_driver` is not ported, so EEFS is not
+  mounted into the RTEMS IMFS and `open()`/`fopen()` do not reach it. The driver also has no call to release a device
+  (a reboot is the only way to re-read the media through the driver; the library's `EEFS_LibFreeFS` +
+  `EEFS_LibInitFS` do it for a volume the application owns).
+- **Real hardware not exercised.** Every test runs on the RAM simulator (host and QEMU). The HAL contract (2.3) and
+  the NAND assumptions above are what a BSP driver must honour; a controller whose ECC reports erased pages as
+  uncorrectable, or that cannot program the OOB marker byte alone, needs handling in its `ReadPage`/`ProgramPage`.
+- **Equal-`Seq` checkpoints** in one mirror (never written by the library, 5.3) would be resolved differently by the
+  library (longest chain) and the bootloader (first valid block).
+
+## 17. Changelog
+
+User decisions (they supersede the plan and earlier revisions of this spec):
+
+| Date | Decision | Where |
+|---|---|---|
+| 2026-10-15 | Copy-on-write replaces in-place modify: every rewrite writes a new first block and fresh blocks for changed data, keeps unchanged blocks (length, CRC and byte compare), and changes `FirstBlock`, a directory change made live by the next commit; no in-place fallback | 6.2, 6.3, 15.24 |
+| 2026-10-15 | Rename and SetFileAttributes rewrite only the first block | 6.6, 15.16 |
+| 2026-10-15 | Reserved spare pool (`EEFS_NAND_RESERVE_BLOCKS` 16, `EEFS_NAND_BADBLOCK_RESERVE` 4) and round-robin allocation from a RAM cursor | 6.9, 15.23 |
+| 2026-10-15 | `EEFS_NAND_VERIFY_ON_OPEN` defaults to 0: Open checks page 0 only | 6.4, 15.9 |
+| 2026-10-15 | RAM budget of ~62 KB per volume accepted | 2.5, 15.19 |
+| 2026-10-15 | No per-block "next block" header; page 0's `Blocks[]` stays the only chaining | FMT 3.3, 15.25 |
+| 2026-10-15 | Deployment target: RTEMS 6/7, health check in a low-priority background task next to writer tasks, so a real lock ships with EEFS (`EEFS_LOCK=rtems`, default unchanged) | 13 |
+
+Spec revisions made during delivery (behaviour settled by the implementation, now in the main text):
+
+- Resync only a mirror that lags (the first revision resynced every failed mirror), so a resync never repeats a
+  mirror's own last `Seq` (5.4); equal-`Seq` checkpoints are handled defensively (5.3).
+- A rebuild accepts a candidate only if its first block's data matches `Blocks[0].Crc32`, and `EEFS_NOT_FORMATTED`
+  means "no valid metadata page at all" (8.1, FMT 6); the bootloader's scan applies the same check (FMT 7.2).
+- `@` is reserved in paths (6.1); A/B calls refuse a write-protected volume and the `All` variants count the entries
+  set (2.6, 7.2); every program and erase bumps `VolumeChangeCounter` (4); ReclaimOrphans erases only blocks free in
+  `Working` and `Base` and off the cleanup list (8.4); the health check's per-phase rules (10.4).
+
+Delivery:
+
+| Phase | Commit | Content |
+|---|---|---|
+| spec | `0f38f0f`, `1cf1e10`, `8e6b9a7` | format and implementation spec; first-block rename/setattr; copy-on-write, reserve pool, verify-on-open off |
+| 1 | `c18c043` | backend split, CMake, HAL, CRC, format module, simulator |
+| 7 | `983ef69` | `microeefs_nand` bootloader library |
+| 2 | `b6280d8` | journaled directory |
+| 3 | `24ec1ad` | file operations, copy-on-write |
+| 5 | `980bde7` | A/B software loads |
+| 4 | `ce64b1b` | rebuild from metadata pages |
+| 6 | `74658ce` | health check, ReclaimOrphans, opt-in lock hooks |
+| 8 | this series | `EEFS_LOCK` and the RTEMS lock, RTEMS end-to-end test, README/CLAUDE.md, spec consistency pass |
