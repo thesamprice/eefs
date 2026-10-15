@@ -886,9 +886,11 @@ valid empty volume. When a device that holds a volume is formatted again, blocks
 ascending order, so a cut while the directory region is being erased can leave the old volume
 mountable from the mirror that was not erased yet (the complete old state: its data blocks are erased
 later), and a cut while the data region is being erased leaves no directory but some old metadata
-pages: `EEFS_NOT_FORMATTED` until phase 4, after which the rebuild (8.1) would recover the old files
-that were not erased yet. In every case formatting again succeeds. (Tested by the `powercut_sweep_format`
-case: old volume, then `NOT_FORMATTED`, then empty, in that order, at every cut point.)
+pages: the mount then rebuilds (8.1) and recovers the old files that were not erased yet, until the last
+old metadata page is erased (`EEFS_NOT_FORMATTED`). In every case formatting again succeeds. (Tested by the
+`powercut_sweep_format` case: old volume, then a rebuilt directory, then `NOT_FORMATTED`, then empty, in that
+order, at every cut point. Its synthetic files have no data, so their pages fail the first-block CRC and the
+rebuilt directory is empty.)
 
 ### 5.2 Mount (`EEFS_LibInitFS`)
 
@@ -907,9 +909,12 @@ PagesPerBlock + 2 x EEFS_MAX_FILES` pages.
    `PendingCleanup` = the chain's list. Mirror bookkeeping for each `m`: `HasState = Valid`;
    `CurIndex/NextPage/CheckpointSeq/LastSeq` from its chain; `NeedsResync = !Valid || LastSeq <
    Vol->LastSeq`; `EnterNewBlock = Torn || NeedsResync`. Go to step 6.
-5. **No directory**: `EEFS_NandRebuild` (8.1). `EEFS_NOT_FORMATTED` if it finds no metadata
-   page. On success `DirectoryRebuilt = 1`, `LastSeq = max(MaxSeqSeen over both mirrors) + 1`,
-   both mirrors `NeedsResync = EnterNewBlock = 1`, `HasState = 0`.
+5. **No directory**: `EEFS_NandRebuild` (8.1). `EEFS_NOT_FORMATTED` if it finds no valid metadata
+   page (FMT 3.4). On success `DirectoryRebuilt = 1`, `LastSeq = max(MaxSeqSeen over both mirrors) + 1`,
+   both mirrors `NeedsResync = EnterNewBlock = 1`, `HasState = 0`, no pending cleanup. Nothing is
+   written: the first commit (its resync checkpoint, even when the batch is empty) or
+   `EEFS_LibRepairDirectory` persists the rebuilt state. As delivered, steps 6-8 are
+   `EEFS_NandMountFinish` (journal.c), which `EEFS_LibRebuildDirectory` shares.
 6. **Reconcile.** For each entry `i` in use, each slot `s` in use: `EEFS_NandReadPage0(FirstBlock)`.
    - Invalid (`CORRUPT_FILE`/`IO_ERROR`): `SlotFlags[i][s] |= CORRUPT`. If `s` is the active slot
      of an `IsAB` entry: `ActiveFailed = 1` in `Working` and `Base`, `ForceDirty[i]`. Map bytes
@@ -1026,7 +1031,10 @@ mirror": a mirror is only resynced when it really lags, so a resync never writes
 simply starts a new block with a CHECKPOINT at the next commit. `NeedsResync` also forces a CHECKPOINT
 in `EEFS_NandWriteRecordToMirror`, so a mirror whose resync failed is never given a TXN that cannot
 chain onto its records. `EEFS_NandResync` writes `State = Base` with the first `PendingCleanupBase`
-cleanup entries (none at commit time, since the pending cleanup has just run).
+cleanup entries (none at commit time, since the pending cleanup has just run). After a rebuild (5.2 step 5,
+8.3) both mirrors need a resync, and the resync checkpoint of `Base` at `LastSeq` is what persists the
+rebuilt state: as delivered, `EEFS_NandCommit` clears `DirectoryRebuilt` as soon as a mirror holds a record
+at `LastSeq`, so a `Commit` with nothing else to write still persists a rebuilt directory.
 
 `EEFS_NandEnterBlock(M)`: `CurIndex = (CurIndex + 1) % Count` (or 0 if `!HasState`), erase that
 block; on failure `MarkBad` it (the ring shrinks, indexes shift: recompute `CurIndex` to the block
@@ -1408,7 +1416,7 @@ pass 2: process the winners in DESCENDING WriteSeq order (overlap rule): read it
         Otherwise: Entry (row): InUse 1, Path, IsAB = any Explicit, FileType/Attributes/CreationDate from the active slot's P0
         (ActiveSlot = A present ? A : B), FallbackCompatible 0, ActiveFailed 0; Slot[s] = fields from P0; each Blocks[k] -> OWNER(row, s).
         A row whose winners were all discarded is dropped.
-if no row: return EEFS_NOT_FORMATTED
+if no valid metadata page was seen: return EEFS_NOT_FORMATTED
 Base = Working. NextWriteSeq per 5.2 step 8.
 ```
 
@@ -1416,17 +1424,52 @@ The scratch table (64 x (256 + 2 x 8) ~ 17 KB) is **built inside `Base.Entry[]`*
 unused during the rebuild, to avoid extra static RAM; pass 2 then writes `Working` and finally
 copies to `Base`.
 
+As delivered:
+
+- **Bad-block markers** are read with `EEFS_NandHasBadMarker` (every `BadMarkerPages` page, as at
+  format), not only from the OOB of page 0.
+- **Candidate order.** Pass 1 compares `WriteSeq` before it checks `Blocks[0].Crc32`, so the data
+  pages are read only for a candidate that would win. A candidate that fails the check is skipped
+  without replacing the current winner, so an older complete copy still wins over a newer torn one.
+  Ties in pass 2 (equal `WriteSeq`, which only a crafted image has) go to the lower first block.
+- **`EEFS_NOT_FORMATTED`** is returned only when the data region holds no valid metadata page at all
+  (FMT 3.4), matching the user requirement and the bootloader's scan. A device whose only metadata
+  pages fail the first-block CRC mounts with an empty rebuilt directory. (The first revision said
+  "no row", which would also have refused such a device.)
+- **`IsAB`** is set from the accepted winners only (a discarded explicit-slot winner does not make
+  the entry A/B).
+- A winner that lists a block whose map value is BAD (a bad-block marker) is accepted; the block
+  stays BAD and the mount's reconcile step flags the slot `CROSSLINK` (`rebuild_crosslink_flagged`).
+- A path that finds the scratch table full is ignored: with more than `EEFS_MAX_FILES` paths on the
+  media, the paths whose first metadata page comes last in block order are left out (their blocks
+  stay free). A row taken by a path whose winners are all discarded is not reused.
+- `Working.WriteSeqHigh` = the highest `WriteSeq` of every valid metadata page seen (also of losers and
+  rejected pages), so `NextWriteSeq` (5.2 step 8) is above every page on the device.
+- `FormatTime` is not recoverable and is 0 until a checkpoint is written.
+
 ### 8.2 `EEFS_LibRepairDirectory`
 
 `RunPendingCleanup`; then `EEFS_NandCommit(ForceCheckpointBoth = TRUE)`: both mirrors enter a new
 block and receive a CHECKPOINT with `Seq = LastSeq + 1` (uncommitted changes are committed by the
-same record). Clears `DirectoryRebuilt`. `EEFS_IO_ERROR` if neither mirror accepts it.
+same record). Clears `DirectoryRebuilt`. `EEFS_IO_ERROR` if neither mirror accepts it. (After a
+rebuild, the resync of 5.4 first writes a CHECKPOINT at `LastSeq` into a new block of each mirror,
+then the forced CHECKPOINT at `LastSeq + 1` goes into the next block.)
 
 ### 8.3 `EEFS_LibRebuildDirectory`
 
 Requires no open files/dir (`DEVICE_IS_BUSY`), `Working == Base` apart from `ForceDirty`
 (`TRANSACTION_ERROR`), no active health check. Re-runs mount steps 2, 5 (rebuild), 6, 7, 8 on the
 mounted volume. Use: a directory that mounted but is believed wrong.
+
+As delivered: a pending cleanup loaded from the media is run first (so a committed removal whose
+cleanup erase was cut does not come back); step 2 is not re-run (the directory-region map, with its
+bad blocks, and the mirror rings in RAM are current; data-region BAD marks are kept too). `LastSeq` =
+`max(LastSeq, MaxSeqSeen of both mirrors) + 1`; the mirrors keep their state but get `NeedsResync =
+EnterNewBlock = 1`, so the next commit writes a CHECKPOINT of the rebuilt state into a new block of each
+ring without erasing the current one. `ForceDirty` and `SlotFlags` are cleared before the rebuild, and
+`NextWriteSeq` never decreases. Nothing is written. When the rebuild finds no metadata page
+(`EEFS_NOT_FORMATTED`), the volume is mounted again from its directory (still nothing written; the last
+health summary is kept) and the code is returned; if that mount fails too, the volume is left unmounted.
 
 ### 8.4 `EEFS_LibReclaimOrphans`
 
@@ -1473,7 +1516,8 @@ CRCs (full rule). Return codes: `EEFS_SUCCESS`, `EEFS_INVALID_ARGUMENT`, `EEFS_F
 scan found no metadata page at all). Page reads: `DirRegionBlocks + 2 x 2 x PagesPerBlock`
 (two passes over at most two chains) + 1 for page 0 + 1 per data page loaded (full pages are read
 straight into the destination and only the file's last, partial page goes through `PageBuffer`, so page 0
-is never re-read); scan fallback adds `BlockCount - DirRegionBlocks`.
+is never re-read); scan fallback adds `BlockCount - DirRegionBlocks`, plus the first block's data pages of
+each page 0 of the name that would win (the first-block CRC check of FMT 7.2 step 3, added in phase 4).
 
 Candidate tracking: one `EEFS_NandEntry_t` (328 bytes) plus its index; `MAPCHUNK` and `CLEANUP`
 items are skipped by length. A checkpoint resets the candidate before its items are applied.
@@ -1994,6 +2038,24 @@ some removed and cleaned, then raw-erase the dir region; mount returns `SUCCESS`
 `FallbackCompatible = 0`; `IsAB` from explicit slots).
 
 Done when: `nand_rebuild_*` passes.
+
+As delivered: all the cases above, plus `rebuild_max_files_overflow` (more paths on the media than
+`EEFS_MAX_FILES`), `rebuild_directory_api_requires_idle` also covering the pending cleanup run first and
+`EEFS_NOT_FORMATTED` leaving the volume mounted, `repair_directory_persists_and_clears_flag` also covering a
+plain Commit persisting a rebuilt state, and these sweeps, each over every program and erase of the operation
+and its commit in all three torn modes, on a device of `DirRegionBlocks + 112` blocks: `rebuild_sweep_cut_rename`,
+`rebuild_sweep_cut_modify` (the first block and two others change), `rebuild_sweep_cut_new_write` and
+`rebuild_sweep_batch_then_rebuild` (the `powercut` batch). After each cut the directory region is erased and the
+mount must rebuild without writing; the state must be exactly the state before or after the operation
+(non-decreasing in the cut point; for the batch, each name holds one of the versions the batch can leave and the
+renamed file appears under exactly one name), every slot must pass `EEFS_LibVerifyFile`, `NextWriteSeq` must be
+above every metadata page, and `EEFS_LibRepairDirectory` followed by a remount must give the same state from the
+checkpoint with both mirrors in agreement. `rebuild_sweep_repair_directory` cuts `RepairDirectory` itself on a
+rebuilt volume. The `micro` suite gained `micro_scan_rejects_torn_first_block` (the bootloader scan's first-block
+CRC check), and `micro_scan_fallback_when_no_directory` damages a second data block instead of the first so that its
+"no fallback" case still applies. Mount step 5 is in `EEFS_NandMount`; mount steps 6-8 became
+`EEFS_NandMountFinish` (declared in `eefs_nand_internal.h`). The journal case `powercut_sweep_format` now expects a
+rebuilt (empty) directory between the old volume and `NOT_FORMATTED`.
 
 ### Phase 5: A/B
 

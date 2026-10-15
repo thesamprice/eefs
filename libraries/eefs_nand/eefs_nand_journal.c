@@ -221,8 +221,6 @@ int32 EEFS_NandMount(EEFS_InodeTable_t *Vol)
     uint8                       Best;
     uint16                      CleanupCount = 0;
     uint32                      MaxFiles = 0;
-    uint32                      MaxPageWriteSeq = 0;
-    uint32                      High;
     int32                       Status;
 
     /* step 2: map skeleton, directory bad blocks, rings */
@@ -237,42 +235,80 @@ int32 EEFS_NandMount(EEFS_InodeTable_t *Vol)
     EEFS_NandScanMirror(Vol, 0, &Chain[0]);
     EEFS_NandScanMirror(Vol, 1, &Chain[1]);
     if ((Chain[0].Valid == FALSE) && (Chain[1].Valid == FALSE)) {
-        /* step 5 (no directory): the rebuild from the metadata pages is phase 4 */
-        return(EEFS_NOT_FORMATTED);
-    }
-    Best = ((Chain[1].Valid == TRUE) && ((Chain[0].Valid == FALSE) || (Chain[1].LastSeq > Chain[0].LastSeq))) ? 1 : 0;
-
-    /* step 4: replay */
-    Status = EEFS_NandApplyChain(Vol, Best, &Chain[Best], &Vol->Working, Vol->PendingCleanup, &CleanupCount, &MaxFiles);
-    if (Status != EEFS_SUCCESS) {
-        return(Status);
-    }
-    for (b = 0; b < Geo->DirRegionBlocks; b++) {
-        if (DirBad[b]) {
-            Vol->Working.Map[b] = EEFS_NAND_MAP_BAD;
+        /* step 5 (no directory): rebuild from the metadata pages in RAM; the next commit or RepairDirectory persists it */
+        Status = EEFS_NandRebuild(Vol);
+        if (Status != EEFS_SUCCESS) {
+            return(Status);
         }
-    }
-    Vol->LastSeq = Chain[Best].LastSeq;
-    Vol->PendingCleanupCount = CleanupCount;
-    Vol->PendingCleanupBase = CleanupCount;
-    for (m = 0; m < 2; m++) {
-        Mir = &Vol->Mirror[m];
-        Mir->HasState = Chain[m].Valid;
-        if (Chain[m].Valid) {
-            Mir->CurIndex = Chain[m].BlockIdx;
-            Mir->NextPage = Chain[m].NextPage;
-            Mir->CheckpointSeq = Chain[m].CheckpointSeq;
-            Mir->LastSeq = Chain[m].LastSeq;
-        }
-        else {
+        Vol->DirectoryRebuilt = TRUE;
+        Vol->LastSeq = ((Chain[1].MaxSeqSeen > Chain[0].MaxSeqSeen) ? Chain[1].MaxSeqSeen : Chain[0].MaxSeqSeen) + 1;
+        Vol->PendingCleanupCount = 0;
+        Vol->PendingCleanupBase = 0;
+        for (m = 0; m < 2; m++) {
+            Mir = &Vol->Mirror[m];
+            Mir->HasState = FALSE;
             Mir->CurIndex = 0;
             Mir->NextPage = 0;
             Mir->CheckpointSeq = 0;
             Mir->LastSeq = 0;
+            Mir->NeedsResync = TRUE;
+            Mir->EnterNewBlock = TRUE;
         }
-        Mir->NeedsResync = (uint8)((Chain[m].Valid == FALSE) || (Chain[m].LastSeq < Vol->LastSeq));
-        Mir->EnterNewBlock = (uint8)(Chain[m].Torn || Mir->NeedsResync);
     }
+    else {
+        Best = ((Chain[1].Valid == TRUE) && ((Chain[0].Valid == FALSE) || (Chain[1].LastSeq > Chain[0].LastSeq))) ? 1 : 0;
+
+        /* step 4: replay */
+        Status = EEFS_NandApplyChain(Vol, Best, &Chain[Best], &Vol->Working, Vol->PendingCleanup, &CleanupCount,
+                                     &MaxFiles);
+        if (Status != EEFS_SUCCESS) {
+            return(Status);
+        }
+        for (b = 0; b < Geo->DirRegionBlocks; b++) {
+            if (DirBad[b]) {
+                Vol->Working.Map[b] = EEFS_NAND_MAP_BAD;
+            }
+        }
+        Vol->LastSeq = Chain[Best].LastSeq;
+        Vol->PendingCleanupCount = CleanupCount;
+        Vol->PendingCleanupBase = CleanupCount;
+        for (m = 0; m < 2; m++) {
+            Mir = &Vol->Mirror[m];
+            Mir->HasState = Chain[m].Valid;
+            if (Chain[m].Valid) {
+                Mir->CurIndex = Chain[m].BlockIdx;
+                Mir->NextPage = Chain[m].NextPage;
+                Mir->CheckpointSeq = Chain[m].CheckpointSeq;
+                Mir->LastSeq = Chain[m].LastSeq;
+            }
+            else {
+                Mir->CurIndex = 0;
+                Mir->NextPage = 0;
+                Mir->CheckpointSeq = 0;
+                Mir->LastSeq = 0;
+            }
+            Mir->NeedsResync = (uint8)((Chain[m].Valid == FALSE) || (Chain[m].LastSeq < Vol->LastSeq));
+            Mir->EnterNewBlock = (uint8)(Chain[m].Torn || Mir->NeedsResync);
+        }
+    }
+
+    /* steps 6-8 */
+    EEFS_NandMountFinish(Vol);
+
+    /* step 9 */
+    Vol->Mounted = TRUE;
+    Vol->VolumeChangeCounter = 1;
+    return(EEFS_SUCCESS);
+
+} /* End of EEFS_NandMount() */
+
+/* Section 5.2 steps 6-8 on a loaded (or rebuilt) Working state */
+void EEFS_NandMountFinish(EEFS_InodeTable_t *Vol)
+{
+    const EEFS_NandGeometry_t  *Geo = &Vol->Dev->Geometry;
+    uint32                      MaxPageWriteSeq = 0;
+    uint32                      High;
+    uint32                      b;
 
     /* step 6: reconcile the slots with their metadata pages */
     EEFS_NandReconcile(Vol, &MaxPageWriteSeq);
@@ -292,12 +328,7 @@ int32 EEFS_NandMount(EEFS_InodeTable_t *Vol)
     if (MaxPageWriteSeq > High) High = MaxPageWriteSeq;
     Vol->NextWriteSeq = High + 1 + EEFS_NAND_WRITESEQ_MOUNT_GAP;
 
-    /* step 9 */
-    Vol->Mounted = TRUE;
-    Vol->VolumeChangeCounter = 1;
-    return(EEFS_SUCCESS);
-
-} /* End of EEFS_NandMount() */
+} /* End of EEFS_NandMountFinish() */
 
 /* Mirror rings: the good directory blocks of each half, ascending */
 int32 EEFS_NandBuildRings(EEFS_InodeTable_t *Vol)
@@ -623,6 +654,14 @@ int32 EEFS_NandCommit(EEFS_InodeTable_t *Vol, boolean ForceCheckpointBoth)
         EEFS_NandRunPendingCleanup(Vol);
     }
     EEFS_NandResync(Vol);
+    if (Vol->DirectoryRebuilt == TRUE) {
+        /* the resync CHECKPOINT of a rebuilt state (Base at LastSeq) is what persists it */
+        for (m = 0; m < 2; m++) {
+            if ((Vol->Mirror[m].HasState == TRUE) && (Vol->Mirror[m].LastSeq >= Vol->LastSeq)) {
+                Vol->DirectoryRebuilt = FALSE;
+            }
+        }
+    }
 
     EEFS_NandDiff(Vol, EntryMask, &MapChanged);
     Dirty = (boolean)((MapChanged != 0) || (Vol->PendingCleanupCount != 0));

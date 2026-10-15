@@ -44,6 +44,7 @@ typedef struct
 EEFS_NandGeometry_t         NandTest_Geo;
 
 extern const NandTest_Case_t NandTest_MicroCases[];     /* test_micro.c */
+extern const NandTest_Case_t NandTest_RebuildCases[];   /* test_rebuild.c */
 
 static const NandTest_Suite_t NandTest_Suites[] = {
     { "layout", NandTest_LayoutCases },
@@ -52,6 +53,7 @@ static const NandTest_Suite_t NandTest_Suites[] = {
     { "micro",  NandTest_MicroCases },
     { "fileops", NandTest_FileopsCases },
     { "powercut", NandTest_PowercutCases },
+    { "rebuild", NandTest_RebuildCases },
     { NULL,     NULL }
 };
 

@@ -27,7 +27,8 @@
  *   Replay (section 7.2): one candidate entry is tracked by index.  A checkpoint clears it; an ENTRY item with the
  *     candidate's index replaces it (same name, in use) or clears it (removed or renamed away); any other in-use ENTRY
  *     with the name becomes the candidate.  VOLUME items are checked against the geometry and the build.
- *   Scan fallback (section 6 for one name), only when neither mirror has a valid checkpoint.
+ *   Scan fallback (section 6 for one name), only when neither mirror has a valid checkpoint.  A candidate page 0 is
+ *     accepted only if its first block's data matches Blocks[0].Crc32 (section 7.2 step 3).
  *   Slot choice and loading (sections 7.3, 7.4).
  *
  *   Loading reads full data pages straight into the destination; only a final partial page goes through PageBuffer,
@@ -89,6 +90,8 @@ static void     MicroEEFS_NandScanMirror(const EEFS_NandDevice_t *Dev, uint8 *Bu
 static int32    MicroEEFS_NandReplay(const EEFS_NandDevice_t *Dev, uint8 *Buf, const MicroEEFS_NandChain_t *Chain,
                                      const char *Path, EEFS_NandEntry_t *Entry, boolean *Found);
 static boolean  MicroEEFS_NandBlocksInRange(const EEFS_NandGeometry_t *Geo, const uint8 *Page, uint32 BlockCount);
+static boolean  MicroEEFS_NandFirstBlockGood(const EEFS_NandDevice_t *Dev, uint8 *Buf, uint32 Block, uint32 FileSize,
+                                             uint32 Crc);
 static void     MicroEEFS_NandScan(const EEFS_NandDevice_t *Dev, uint8 *Buf, const char *Path,
                                    EEFS_NandEntry_t *Entry, boolean *Found, boolean *AnyPage);
 static int32    MicroEEFS_NandCheckPage0(const EEFS_NandDevice_t *Dev, uint8 *Buf, const EEFS_NandEntry_t *Entry,
@@ -355,8 +358,32 @@ static boolean MicroEEFS_NandBlocksInRange(const EEFS_NandGeometry_t *Geo, const
 
 } /* End of MicroEEFS_NandBlocksInRange() */
 
+/* TRUE when the data pages of Block (pages 1..) match the first block's CRC of a FileSize-byte file.  Overwrites Buf. */
+static boolean MicroEEFS_NandFirstBlockGood(const EEFS_NandDevice_t *Dev, uint8 *Buf, uint32 Block, uint32 FileSize,
+                                            uint32 Crc)
+{
+    uint32  PageSize = Dev->Geometry.PageSize;
+    uint32  Count = EEFS_NandBlockDataRange(PageSize, Dev->Geometry.PagesPerBlock, FileSize, 0, NULL);
+    uint32  State = EEFS_CRC32_INIT;
+    uint32  Done;
+    uint32  Chunk;
+    uint32  Page;
+
+    for (Done = 0, Page = 1; Done < Count; Done += Chunk, Page++) {
+        Chunk = ((Count - Done) < PageSize) ? (Count - Done) : PageSize;
+        if (MicroEEFS_NandRead(Dev, Block, Page, Buf, NULL) != EEFS_SUCCESS) {
+            return(FALSE);
+        }
+        State = EEFS_Crc32Update(State, Buf, Chunk);
+    }
+    return((EEFS_Crc32Final(State) == Crc) ? TRUE : FALSE);
+
+} /* End of MicroEEFS_NandFirstBlockGood() */
+
 /* Scan fallback (docs/nand-format.md 6, for one name): the valid metadata page with the highest WriteSeq per slot
- * (lowest block on a tie) wins.  AnyPage tells whether any valid metadata page exists at all. */
+ * (lowest block on a tie) wins, provided its first block's data matches Blocks[0].Crc32 (a page 0 left by an
+ * interrupted write can be complete while the data pages of its own block are not).  AnyPage tells whether any valid
+ * metadata page exists at all. */
 static void MicroEEFS_NandScan(const EEFS_NandDevice_t *Dev, uint8 *Buf, const char *Path,
                                EEFS_NandEntry_t *Entry, boolean *Found, boolean *AnyPage)
 {
@@ -365,6 +392,7 @@ static void MicroEEFS_NandScan(const EEFS_NandDevice_t *Dev, uint8 *Buf, const c
     EEFS_NandSlot_t            *S;
     uint32                      PathLen = (uint32)strlen(Path);
     uint32                      Block;
+    uint32                      Crc0;
     uint8                       Slot;
     uint8                       Explicit[2];
     uint32                      Attributes[2];
@@ -400,6 +428,10 @@ static void MicroEEFS_NandScan(const EEFS_NandDevice_t *Dev, uint8 *Buf, const c
         S = &Entry->Slot[Slot];
         if ((S->InUse != 0) && (P.WriteSeq <= S->WriteSeq)) {
             continue;
+        }
+        EEFS_NandPage0Block(Buf, 0, NULL, &Crc0);
+        if (MicroEEFS_NandFirstBlockGood(Dev, Buf, Block, P.FileSize, Crc0) == FALSE) {
+            continue;                                   /* torn: page 0 was written before its block's data */
         }
         S->InUse = 1;
         S->FirstBlock = (uint16)Block;

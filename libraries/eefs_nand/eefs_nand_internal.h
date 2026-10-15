@@ -155,6 +155,7 @@ void            EEFS_NandTouch(EEFS_InodeTable_t *Vol);
 /* Rebuild (eefs_nand_rebuild.c, phase 4), section 3.4 */
 
 int32           EEFS_NandRebuild(EEFS_InodeTable_t *Vol);
+void            EEFS_NandMountFinish(EEFS_InodeTable_t *Vol);   /* mount steps 6-8 (journal.c), shared with RebuildDirectory */
 int32           EEFS_NandReclaimOrphans(EEFS_InodeTable_t *Vol);
 
 #endif

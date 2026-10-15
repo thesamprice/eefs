@@ -497,6 +497,9 @@ rebuilder should check `Blocks[0].Crc32` against the first block's data before a
 in step 1 and treat a candidate that fails it as an orphan (the library's rebuild does; a reader that
 skips the check may pick such a copy and then fail its CRC check when loading it).
 
+The library reports the device as not formatted (`EEFS_NOT_FORMATTED`) only when neither mirror has a
+valid checkpoint and the data region holds no valid metadata page at all.
+
 A rebuild recovers every completely written file. It cannot distinguish committed from
 uncommitted: it may include files from a batch that was never committed, and a removed or
 superseded copy whose cleanup erase was interrupted. The library mounts the rebuilt state in RAM
@@ -518,10 +521,14 @@ kilobyte of stack. It never writes.
    - otherwise, if `InUse` = 1 and `Path` equals the name, the item becomes the candidate.
    Skip MAPCHUNK and CLEANUP. Check VOLUME against the geometry.
 3. If step 1 found no valid checkpoint in either mirror, use the **scan fallback**: run section 6
-   for the one name only (read every data block's page 0, keep the highest `WriteSeq` per slot).
+   for the one name only (read every data block's page 0, keep the highest `WriteSeq` per slot,
+   the lower block on a tie). A candidate is accepted only if its first block's data matches its
+   `Blocks[0].Crc32` (section 6: a page 0 left by an interrupted write can be complete while its
+   own block's data is not); a rejected candidate does not displace an older accepted one.
    The result has `IsAB` per section 6, `ActiveSlot` = A if present else B, and
    `FallbackCompatible` = 0. The scan is **never** used when the directory is valid but a metadata
-   page is bad: scanning could pick up a removed, superseded or incompatible copy.
+   page is bad: scanning could pick up a removed, superseded or incompatible copy. The scan does
+   not apply the overlap rule (it tracks one name); the library's rebuild does.
 4. No candidate: `EEFS_FILE_NOT_FOUND`.
 
 ### 7.3 Choosing the slot and loading
