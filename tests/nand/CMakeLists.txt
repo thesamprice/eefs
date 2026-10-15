@@ -17,12 +17,13 @@ set(EEFS_NAND_TEST_SOURCES
     test_micro.c
     test_fileops.c
     test_powercut.c
+    test_ab.c
     nand_fixture.c
     nand_vol.c
     ${PROJECT_SOURCE_DIR}/libraries/microeefs_nand/microeefs_nand.c)
 
-# Suites registered so far (later phases append rebuild ab health)
-set(EEFS_NAND_SUITES layout sim journal micro fileops powercut)
+# Suites registered so far (later phases append rebuild health)
+set(EEFS_NAND_SUITES layout sim journal micro fileops powercut ab)
 
 # PageSize:OobSize:PagesPerBlock
 set(EEFS_NAND_GEOMETRIES 4096:224:128 2048:64:64 8192:448:64)
@@ -90,3 +91,4 @@ endforeach()
 
 add_test(NAME nand_default_config_4096 COMMAND eefs_nand_test_default fileops 4096 224 128 ${EEFS_NAND_TEST_BLOCKS})
 add_test(NAME nand_verify_on_open_4096 COMMAND eefs_nand_test_verifyopen fileops 4096 224 128 ${EEFS_NAND_TEST_BLOCKS})
+add_test(NAME nand_verify_on_open_ab_4096 COMMAND eefs_nand_test_verifyopen ab 4096 224 128 ${EEFS_NAND_TEST_BLOCKS})

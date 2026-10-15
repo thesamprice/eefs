@@ -6,7 +6,8 @@
  * through the standalone driver, then commit, unmount and remount through the library with a directory change that
  * must survive.  Then the file operations: files written through the driver, committed by the unmount, read back
  * after a remount, rewritten copy-on-write and renamed, and every committed file loaded byte for byte by the
- * bootloader library (microeefs_nand).  Phase 8 replaces it with the full test.
+ * bootloader library (microeefs_nand).  Phase 5: an A/B upload, activation and compatible fallback through the driver,
+ * checked against the bootloader library.  Phase 8 replaces it with the full test.
  * Prints "EEFS RTEMS TEST PASSED" or "EEFS RTEMS TEST FAILED" and exits.
  */
 
@@ -234,6 +235,99 @@ static void check_nand_files(void)
     NandSim_Destroy(Sim);
 }
 
+/* A/B (phase 5): v2 uploaded into B through the driver, B activated with A as the compatible fallback in one commit;
+ * B's metadata page destroyed: Open and the bootloader both fall back to A and report ActiveFailed; a rollback to A
+ * clears it; CopySlotAll promotes A's copy into B. */
+static void check_nand_ab(void)
+{
+    EEFS_NandGeometry_t     Geo;
+    static EEFS_NandDevice_t Dev;   /* not on the stack: its address must differ from the other devices' */
+    EEFS_NandFileInfo_t     Meta;
+    EEFS_NandFileInfo_t     FInfo;
+    MicroEEFS_NandInfo_t    Info;
+    NandSim_t              *Sim;
+    uint32                  Size1 = 70000;
+    uint32                  Size2 = 90001;
+
+    memset(&Geo, 0, sizeof(Geo));
+    Geo.PageSize = 4096;
+    Geo.OobSize = 224;
+    Geo.PagesPerBlock = 128;
+    Geo.BlockCount = 256;
+    Geo.DirRegionBlocks = 16;
+    Geo.BadMarkerPages = EEFS_NAND_BADMARKER_PAGE0;
+    /* the driver has two device slots: the device of check_nand_files is formatted again */
+    Sim = NandSim_Create(&Geo);
+    CHECK(Sim != NULL);
+    if (Sim == NULL) return;
+    NandSim_FillDevice(Sim, &Dev);
+    make_image(Image, Size1, 11);
+    make_image(Image2, Size2, 12);
+
+    CHECK(EEFS_Format("/NANDDEV1", (cpuaddr)&Dev) == EEFS_SUCCESS);
+    CHECK(EEFS_Mount("/NANDDEV1", "/NAND1") == EEFS_SUCCESS);
+    memset(&Meta, 0, sizeof(Meta));
+    Meta.FileType = EEFS_FILE_TYPE_BOOT_FIT;
+    Meta.Slot = EEFS_NAND_SLOT_NONE;
+    Meta.Version = 1;
+    CHECK(EEFS_WriteFile("/NAND1/boot/app.fit", &Meta, Image, Size1) == EEFS_SUCCESS);
+    CHECK(EEFS_Commit("/NAND1") == EEFS_SUCCESS);
+
+    /* upload v2 into B, activate it with v1 as the compatible fallback, one commit */
+    Meta.Slot = EEFS_NAND_SLOT_B;
+    Meta.Version = 2;
+    CHECK(EEFS_WriteFile("/NAND1/boot/app.fit", &Meta, Image2, Size2) == EEFS_SUCCESS);
+    CHECK(EEFS_SetActiveSlotAll("/NAND1", EEFS_NAND_SLOT_B) == 1);
+    CHECK(EEFS_SetFallbackCompatibleAll("/NAND1", 1) == 1);
+    check_micro(&Dev, "/boot/app.fit", Image, Size1, EEFS_FILE_TYPE_BOOT_FIT, 1);   /* not committed yet */
+    CHECK(EEFS_Commit("/NAND1") == EEFS_SUCCESS);
+    check_read("/NAND1/boot/app.fit", Image2, Size2);
+    check_read("/NAND1/boot/app.fit@A", Image, Size1);
+    check_micro(&Dev, "/boot/app.fit", Image2, Size2, EEFS_FILE_TYPE_BOOT_FIT, 2);
+    CHECK(EEFS_GetFileInfo("/NAND1/boot/app.fit", &FInfo) == EEFS_SUCCESS);
+    CHECK(FInfo.IsAB == 1 && FInfo.ActiveSlot == EEFS_NAND_SLOT_B && FInfo.FallbackCompatible == 1);
+    CHECK(FInfo.SlotInfo[0].Version == 1 && FInfo.SlotInfo[1].Version == 2);
+
+    /* B's metadata page destroyed: both the library and the bootloader fall back to A and report ActiveFailed */
+    NandSim_CorruptBytes(Sim, FInfo.SlotInfo[1].FirstBlock, 0, 20, 4);
+    CHECK(EEFS_UnMount("/NAND1") == EEFS_SUCCESS);
+    CHECK(EEFS_Mount("/NANDDEV1", "/NAND1") == EEFS_SUCCESS);
+    check_read("/NAND1/boot/app.fit@A", Image, Size1);
+    {
+        EEFS_Stat_t St;
+        int32       Fd = EEFS_Open("/NAND1/boot/app.fit", O_RDONLY);
+        int32       n;
+        uint32      Total = 0;
+
+        CHECK(Fd >= 0);
+        if (Fd >= 0) {
+            while ((n = EEFS_Read(Fd, &Loaded[Total], 4097)) > 0) Total += (uint32)n;
+            CHECK(Total == Size1);
+            CHECK(memcmp(Loaded, Image, Size1) == 0);
+            CHECK(EEFS_Close(Fd) == EEFS_SUCCESS);
+        }
+        CHECK(EEFS_Stat("/NAND1/boot/app.fit", &St) == EEFS_SUCCESS);
+        CHECK(St.FileSize == Size2);        /* Stat reports the active slot and never falls back */
+    }
+    CHECK(EEFS_GetFileInfo("/NAND1/boot/app.fit@A", &FInfo) == EEFS_SUCCESS);
+    CHECK(FInfo.ActiveFailed == 1);
+    memset(Loaded, 0, sizeof(Loaded));
+    CHECK(MicroEEFS_NandLoadFile(&Dev, Page, "/boot/app.fit", Loaded, sizeof(Loaded), &Info) == EEFS_SUCCESS);
+    CHECK(Info.LoadedSlot == EEFS_NAND_SLOT_A && Info.Info.ActiveFailed == 1);
+    CHECK(memcmp(Loaded, Image, Size1) == 0);
+
+    /* roll back to A (clears ActiveFailed), then promote A's copy into B */
+    CHECK(EEFS_SetActiveSlot("/NAND1/boot/app.fit", EEFS_NAND_SLOT_A) == EEFS_SUCCESS);
+    CHECK(EEFS_CopySlotAll("/NAND1", EEFS_NAND_SLOT_A, EEFS_NAND_SLOT_B) == 1);
+    CHECK(EEFS_UnMount("/NAND1") == EEFS_SUCCESS);
+    check_micro(&Dev, "/boot/app.fit", Image, Size1, EEFS_FILE_TYPE_BOOT_FIT, 1);
+    check_micro(&Dev, "/boot/app.fit@B", Image, Size1, EEFS_FILE_TYPE_BOOT_FIT, 1);
+    CHECK(MicroEEFS_NandFindFile(&Dev, Page, "/boot/app.fit", &Info) == EEFS_SUCCESS);
+    CHECK(Info.Info.ActiveFailed == 0 && Info.Info.ActiveSlot == EEFS_NAND_SLOT_A);
+    CHECK(NandSim_Violations(Sim) == 0);
+    NandSim_Destroy(Sim);
+}
+
 static rtems_task Init(rtems_task_argument ignored)
 {
     (void)ignored;
@@ -244,6 +338,7 @@ static rtems_task Init(rtems_task_argument ignored)
     CHECK(EEFS_Crc32("123456789", 9) == 0xCBF43926UL);
     check_nand_format();
     check_nand_files();
+    check_nand_ab();
 
     printf(Failures == 0 ? "EEFS RTEMS TEST PASSED\n" : "EEFS RTEMS TEST FAILED (%d)\n", Failures);
     exit(Failures == 0 ? 0 : 1);

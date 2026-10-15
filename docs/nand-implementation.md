@@ -608,11 +608,13 @@ typedef struct {
 } EEFS_NandVolumeInfo_t;
 int32 EEFS_LibGetVolumeInfo(EEFS_InodeTable_t *T, EEFS_NandVolumeInfo_t *Info);
 
-/* A/B. Section 7. Name must not carry a suffix for these. */
+/* A/B. Section 7. Name must not carry a suffix for these (INVALID_ARGUMENT). As delivered, every A/B call also returns
+ * READ_ONLY_FILE_SYSTEM when EEFS_LIB_IS_WRITE_PROTECTED; the "All" counts are the entries the setting was applied to,
+ * whether or not a value changed; a non-zero Flag is stored as 1. */
 int32 EEFS_LibSetActiveSlot(EEFS_InodeTable_t *T, char *Name, uint8 Slot);        /* SUCCESS, FILE_NOT_FOUND (entry or that slot not in use), INVALID_ARGUMENT (not IsAB, bad slot) */
-int32 EEFS_LibSetActiveSlotAll(EEFS_InodeTable_t *T, uint8 Slot);                 /* >= 0: entries changed; INVALID_ARGUMENT */
+int32 EEFS_LibSetActiveSlotAll(EEFS_InodeTable_t *T, uint8 Slot);                 /* >= 0: IsAB entries with Slot in use (all set); INVALID_ARGUMENT */
 int32 EEFS_LibSetFallbackCompatible(EEFS_InodeTable_t *T, char *Name, uint8 Flag);/* SUCCESS, FILE_NOT_FOUND, INVALID_ARGUMENT (not IsAB) */
-int32 EEFS_LibSetFallbackCompatibleAll(EEFS_InodeTable_t *T, uint8 Flag);         /* >= 0: entries changed */
+int32 EEFS_LibSetFallbackCompatibleAll(EEFS_InodeTable_t *T, uint8 Flag);         /* >= 0: IsAB entries (all set) */
 int32 EEFS_LibSetFailed(EEFS_InodeTable_t *T, char *Name);                        /* SUCCESS, FILE_NOT_FOUND, INVALID_ARGUMENT (not IsAB) */
 int32 EEFS_LibClearFailed(EEFS_InodeTable_t *T, char *Name);
 int32 EEFS_LibCopySlot(EEFS_InodeTable_t *T, char *Name, uint8 From, uint8 To);  /* SUCCESS, FILE_NOT_FOUND (entry or From not in use), INVALID_ARGUMENT (From == To, not IsAB), PERMISSION_DENIED (To open, or read-only), NO_SPACE_LEFT_ON_DEVICE, TRANSACTION_ERROR, CORRUPT_FILE (source), IO_ERROR */
@@ -1334,11 +1336,14 @@ directory only; page 0 carries `Slot` and `Version` so a rebuild recovers locati
 - `SetActiveSlotAll(s)`: for every in-use `IsAB` entry with `Slot[s].InUse`: as above; returns the
   count. Entries lacking slot `s` are skipped (reported later by health as `AB_ACTIVE_MISSING` only
   if their active slot is missing, which this does not cause).
-- `SetFallbackCompatible(Name, f)` / `...All(f)`: `IsAB` required; sets the flag. Returns count for
-  All.
+- `SetFallbackCompatible(Name, f)` / `...All(f)`: `IsAB` required; sets the flag (any non-zero `f` is
+  stored as 1). Returns count for All.
 - `SetFailed(Name)` / `ClearFailed(Name)`: `IsAB` required; set/clear `ActiveFailed`. `SetFailed`
   is what the application calls after the bootloader reported `ActiveFailed` through the boot-info
-  handoff. All of these write `Working` only and need a commit.
+  handoff. All of these write `Working` only and need a commit. As delivered: the volume must not be
+  write-protected (`EEFS_READ_ONLY_FILE_SYSTEM`); `READONLY` files are not refused (the flags are directory
+  metadata, not file content); setting a value an entry already has still counts for the `All` variants, and
+  `SetActiveSlot` to the slot that is already active still clears `ActiveFailed`.
 
 ### 7.3 Open resolution with fallback
 
@@ -1364,17 +1369,22 @@ ParseName (NONE only); From != To, both in {A, B}; i = FindEntry; IsAB required.
     if !IsAB and From == A: allowed, sets IsAB = 1 on success)
 Slot[From].InUse else FILE_NOT_FOUND; descriptor open on (i, To) -> PERMISSION_DENIED; READONLY -> PERMISSION_DENIED
 RunPendingCleanup; cleanup room for 1 if Slot[To].InUse else TRANSACTION_ERROR
-read From's page 0 (CORRUPT_FILE -> return, no change); allocate AllocBlocks(From) blocks for OWNER(i, To) with ALLOC_NEW (NO_SPACE -> return)
+read From's page 0 (CORRUPT_FILE/IO_ERROR -> flag the source as a failed validation (SLOTFLAG_CORRUPT, ActiveFailed if it is the active
+    copy) and return, no change); allocate AllocBlocks(From) blocks for OWNER(i, To) with ALLOC_NEW (NO_SPACE -> return)
 NewP0 = From's P0 with Slot = To, WriteSeq = NextWriteSeq++; Blocks[] = new list; CRCs carried over
 EEFS_NandWriteCopy(i, From, NewP0, NewBlocks)  -> CORRUPT_FILE (source block CRC mismatch while copying: release, return) / IO_ERROR (release, return)
-if Slot[To].InUse: FreeSlot(i, To)
+if Slot[To].InUse: FreeBlocksExcept(i, To, NewBlocks) + AddCleanup(old FirstBlock)
+    (not FreeSlot: the new blocks already carry OWNER(i, To), and FreeSlot would mark them FREEING as well)
 Slot[To] = {InUse 1, FirstBlock, AllocBlocks, FileSize, Version (From's), WriteSeq (new), FileCrc32, ModificationDate (From's)}
 if To == ActiveSlot: ActiveFailed = 0 (repaired). Clear SlotFlags[i][To]. IsAB = 1. Touch; AUTO_COMMIT.
 ```
 
 `CopySlotAll(From, To)`: for each in-use `IsAB` entry with `Slot[From].InUse`: `CopySlot`; stop at
 the first error and return it (earlier copies stay in `Working`; the caller decides to Commit or
-Abort); otherwise return the count.
+Abort); otherwise return the count. Single-copy entries are not included (opting in is a per-file
+`CopySlot`). A source whose data fails its CRC while being copied is `EEFS_CORRUPT_FILE` with the
+destination blocks released (and the first one erased if its page 0 was written), so the volume's free
+count is as before the failing entry.
 
 ### 7.5 `EEFS_NandWriteCopy`
 
@@ -1386,7 +1396,9 @@ destination page with verify. After each source block, compare its CRC with the 
 destination erase/program/verify failure: `MarkBad`, allocate one replacement block for that
 position with `ALLOC_REPLACE` (`NO_SPACE` -> `EEFS_IO_ERROR`), rebuild `NewP0` (`Blocks[]` changed) and restart the
 copy, up to `EEFS_NAND_WRITE_RETRIES` times. The destination page 0 is encoded into `PageBuf` and
-written last. The copy goes page by page through the HAL; a BSP with a hardware block buffer may
+written last. On every failure, including a source page 0 that no longer reads before anything was
+written, the destination blocks that are still owned are released (as delivered in phase 5; phase 3 left
+them allocated in that early case). The copy goes page by page through the HAL; a BSP with a hardware block buffer may
 optimize inside its `ProgramPage`.
 
 ## 8. Rebuild, repair, orphans
@@ -2020,6 +2032,45 @@ after), `ab_modify_active_slot_is_safe` (rewrite the active slot in a batch, cut
 Commit: the old active copy is intact and loads), `ab_rebuild_recovers_locations_versions`.
 
 Done when: `nand_ab_*` and `nand_verify_on_open_ab_4096` pass.
+
+As delivered: the setters, `CopySlot(+All)` and the Open fallback in `eefs_nand_fileapi.c` (the driver
+wrappers already existed); `ActiveFailed` propagation from Open, VerifyFile and reconcile was already in
+place from phases 2 and 3 and is now exercised. Suite `ab` (`tests/nand/test_ab.c`, all three geometries,
+and `nand_verify_on_open_ab_4096`) has the cases above except that `ab_powercut_sweep_upload_activate_promote`
+is three sweeps (`ab_powercut_sweep_upload_activate`, `..._promote_copyslot_all`, `..._rollback`), plus
+`ab_workflow_upload_activate_promote_rollback` (the whole workflow with the directory checked after each step),
+`ab_copyslot_reserve_and_own_blocks` (ALLOC_NEW floor with no change on `NO_SPACE`, while a rewrite of the same
+slot still fits; A and B disjoint and each owned in the map), `ab_copyslot_open_rules` and
+`ab_bootloader_agrees_with_library` (library Open and `MicroEEFS_NandLoadFile` agree on return code, slot,
+content and `ActiveFailed` for good, corrupt-page-0, page-0 ECC, data-CRC and data ECC faults of the active copy,
+with and without `FallbackCompatible`, a committed `SetFailed`, both copies bad, explicit names and a B-only
+file; the data faults only with `EEFS_NAND_VERIFY_ON_OPEN`, since by default Open checks page 0 only and
+VerifyFile is what detects them). The sweeps cut every program and erase of the upload + `SetActiveSlotAll(B)` +
+`SetFallbackCompatibleAll(1)` + Commit, of `CopySlotAll(B, A)` + `SetActiveSlotAll(A)` + Commit, and of the
+rollback commit, in all three torn modes; after each cut the directory is exactly pre or post, every copy reads
+back exactly under its `@A`/`@B` name, and every file boots its active load through `microeefs_nand` with no
+fallback. `ab_rebuild_recovers_locations_versions` checks the bootloader scan now and the library rebuild once
+phase 4 is merged (it detects the phase 4 stub of `EEFS_LibRebuildDirectory`; after the merge it is strict).
+Mutations run and reverted: Open ignoring `FallbackCompatible`, CopySlot freeing its new blocks (`FreeSlot`),
+CopySlot sharing the source's data blocks, CopySlot with `ALLOC_MODIFY`, and SetActiveSlot keeping
+`ActiveFailed`; each made at least one `ab` case fail. Notes for phase 6:
+
+- `ActiveFailed` is set by a failed validation of the active copy (Open, including when it then falls back;
+  VerifyFile; mount reconcile; a CopySlot or rewrite whose source page 0 or CRC fails) and by `SetFailed`. The
+  first kind is recorded in `Base` too (when `Base` holds the same slot record) with `ForceDirty`, so Abort keeps
+  it and the next commit persists it. It is cleared by `ClearFailed`, `SetActiveSlot(+All)` (even to the same
+  slot), a rewrite of the active copy and a `CopySlot` into the active slot. A rewrite or copy into the inactive
+  slot does not clear it. The health check's `AB_ACTIVE_CORRUPT` finding (`health_ab_active_corrupt_sets_flag`)
+  should set it through the same path (`EEFS_NandValidateSlot`).
+- CopySlot never shares blocks: after `CopySlot(B, A)` the old A copy's data blocks are FREEING (FREE after the
+  commit) and its first block is on the cleanup list, as for Remove. Until that cleanup erase runs, the old
+  page 0 lists blocks that may already be free or reallocated; like a superseded copy-on-write page 0 it must be
+  reported as `DIR_CLEANUP_PENDING` only, not as an orphan or cross-link.
+- After an upload and activation the two slots normally carry different `Version`s (B being tested); after a
+  promote they are equal. `FallbackCompatible` is set only by the setters (rebuild resets it to 0).
+- A descriptor opened by the fallback has `Fallback = 1` and `Slot` = the inactive slot.
+- `test_ab.c` has static helpers for A/B fixtures and faults (`A_MakeF`, `A_CorruptPage0`, `A_CorruptData`,
+  `A_InjectEcc`, `A_CheckBoot`) that the health tests can copy.
 
 ### Phase 6: health check and ReclaimOrphans
 

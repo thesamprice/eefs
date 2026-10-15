@@ -18,7 +18,8 @@
  *   operations (docs/nand-implementation.md section 6) live here: name parsing, the block allocator with its reserve
  *   classes and round-robin cursor (6.9), whole-file writes with copy-on-write (6.2, 6.3), Remove (6.5), the
  *   first-block rewrite of Rename and SetFileAttributes (6.6), Open/Read/LSeek/Close (6.4, 6.7), Stat, ReadDir,
- *   VerifyFile, GetFileInfo, GetVolumeInfo and ChkDsk.
+ *   VerifyFile, GetFileInfo, GetVolumeInfo and ChkDsk, and the A/B operations of section 7 (the setters, CopySlot and
+ *   the compatible fallback of Open).
  *
  *   Every change goes into Working and becomes durable at the next EEFS_LibCommit.  A slot's blocks are never erased
  *   or programmed while the slot is live: a rewrite writes a new first block plus fresh blocks for the changed data
@@ -27,7 +28,7 @@
  *   references is ever touched before the commit.  Data blocks are programmed first (positions 1..n-1), the first
  *   block last; within a block pages go in ascending order, so page 0 of the first block precedes its own data pages.
  *
- *   All writers (WriteFile, Rename, SetFileAttributes, and CopySlot in phase 5) go through one write job
+ *   All writers (WriteFile, Rename, SetFileAttributes and CopySlot) go through one write job
  *   (EEFS_NandRunWriteJob) whose page source is either the caller's RAM image or the blocks of an existing copy.  A
  *   failed erase, program or read-back verify of a destination block marks the block bad, takes a replacement with
  *   EEFS_NAND_ALLOC_REPLACE and restarts the job, at most EEFS_NAND_WRITE_RETRIES times.
@@ -37,8 +38,12 @@
  *   volumes and protected by EEFS_LIB_LOCK, which must therefore be a single library-wide lock (as it is for the
  *   EEPROM backend).
  *
- *   A/B: names accept "@A"/"@B" and an explicit slot works everywhere; the compatible fallback at Open and the A/B
- *   setters are phase 5.
+ *   A/B: names accept "@A"/"@B", which address one copy and never fall back.  Without a suffix an A/B entry resolves
+ *   to its active slot; Open alone falls back to the inactive copy when the active one fails validation and the entry
+ *   is FallbackCompatible (the same rule as the bootloader, FMT 7.3), and the failed validation sets ActiveFailed.
+ *   The setters change Working only (a commit makes them durable); switching the active slot, rewriting the active
+ *   copy or copying into it clears ActiveFailed.  CopySlot copies every block of one slot into newly allocated blocks
+ *   of the other, so A and B never share a block; the replaced copy is freed in the batch and erased after the commit.
  *
  */
 
@@ -112,7 +117,8 @@ static boolean                  EEFS_NandIsOpen(EEFS_InodeTable_t *Vol, uint32 E
 static boolean                  EEFS_NandIsMounted(EEFS_InodeTable_t *Vol);
 static boolean                  EEFS_NandBlockBytesEqual(EEFS_InodeTable_t *Vol, uint16 OldBlock, uint32 K, const uint8 *Slice,
                                                          uint32 Len);
-static int32                    EEFS_NandResolve(EEFS_InodeTable_t *Vol, char *Name, uint32 *Entry, uint8 *Slot);
+static int32                    EEFS_NandResolve(EEFS_InodeTable_t *Vol, char *Name, uint32 *Entry, uint8 *Slot,
+                                                 uint8 *SlotSpec);
 static int32                    EEFS_NandValidateSlotP0(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot, boolean Full,
                                                         EEFS_NandPage0_t *P);
 static void                     EEFS_NandSlotFailed(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot);
@@ -126,6 +132,9 @@ static int32                    EEFS_NandWriteFileLocked(EEFS_InodeTable_t *Vol,
 static int32                    EEFS_NandRewriteFirstBlocks(EEFS_InodeTable_t *Vol, uint32 Entry, const char *NewPath,
                                                             boolean SetAttr, uint32 Attributes);
 static int32                    EEFS_NandAfterChange(EEFS_InodeTable_t *Vol);
+static int32                    EEFS_NandCheckWritable(EEFS_InodeTable_t *Vol);
+static int32                    EEFS_NandFindABEntry(EEFS_InodeTable_t *Vol, char *Name, int32 *Entry);
+static int32                    EEFS_NandCopySlotLocked(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 From, uint8 To);
 
 #define EEFS_NAND_KEPT_TEST(k)  ((EEFS_NandJobKept[(k) / 8] & (uint8)(1u << ((k) % 8))) != 0)
 #define EEFS_NAND_KEPT_SET(k)   (EEFS_NandJobKept[(k) / 8] |= (uint8)(1u << ((k) % 8)))
@@ -206,9 +215,12 @@ int32 EEFS_LibFreeFS(EEFS_InodeTable_t *InodeTable)
 int32 EEFS_LibOpen(EEFS_InodeTable_t *InodeTable, char *Filename, uint32 Flags, uint32 Attributes)
 {
     EEFS_FileDescriptor_t  *Fd;
+    const EEFS_NandEntry_t *E;
     EEFS_NandPage0_t        P;
     uint32                  Entry;
     uint8                   Slot;
+    uint8                   Spec;
+    uint8                   Fallback = 0;
     int32                   FileDescriptor;
     int32                   ReturnCode;
 
@@ -225,9 +237,17 @@ int32 EEFS_LibOpen(EEFS_InodeTable_t *InodeTable, char *Filename, uint32 Flags, 
     if (EEFS_NandIsMounted(InodeTable) == FALSE) {
         ReturnCode = EEFS_INVALID_ARGUMENT;
     }
-    else if ((ReturnCode = EEFS_NandResolve(InodeTable, Filename, &Entry, &Slot)) == EEFS_SUCCESS) {
-        /* phase 5 adds the compatible fallback of section 7.3 here */
+    else if ((ReturnCode = EEFS_NandResolve(InodeTable, Filename, &Entry, &Slot, &Spec)) == EEFS_SUCCESS) {
         ReturnCode = EEFS_NandValidateSlotP0(InodeTable, Entry, Slot, (boolean)(EEFS_NAND_VERIFY_ON_OPEN != 0), &P);
+        E = &InodeTable->Working.Entry[Entry];
+        if ((ReturnCode != EEFS_SUCCESS) && (Spec == EEFS_NAND_SLOT_NONE) && (E->IsAB != 0) &&
+            (E->FallbackCompatible != 0) && (E->Slot[1 - Slot].InUse != 0)) {
+            /* compatible fallback (section 7.3): the failed validation has set ActiveFailed; the inactive copy is
+             * opened if it validates, else its error is returned */
+            Slot = (uint8)(1 - Slot);
+            Fallback = 1;
+            ReturnCode = EEFS_NandValidateSlotP0(InodeTable, Entry, Slot, (boolean)(EEFS_NAND_VERIFY_ON_OPEN != 0), &P);
+        }
         if (ReturnCode == EEFS_SUCCESS) {
             if ((FileDescriptor = EEFS_NandGetFileDescriptor()) >= 0) {
                 Fd = &EEFS_FileDescriptorTable[FileDescriptor];
@@ -235,7 +255,7 @@ int32 EEFS_LibOpen(EEFS_InodeTable_t *InodeTable, char *Filename, uint32 Flags, 
                 Fd->InodeTable = InodeTable;
                 Fd->InodeIndex = Entry;
                 Fd->Slot = Slot;
-                Fd->Fallback = 0;
+                Fd->Fallback = Fallback;
                 Fd->FirstBlock = InodeTable->Working.Entry[Entry].Slot[Slot].FirstBlock;
                 Fd->FileSize = P.FileSize;
                 Fd->ByteOffset = 0;
@@ -591,7 +611,7 @@ int32 EEFS_LibStat(EEFS_InodeTable_t *InodeTable, char *Filename, EEFS_Stat_t *S
     if (EEFS_NandIsMounted(InodeTable) == FALSE) {
         ReturnCode = EEFS_INVALID_ARGUMENT;
     }
-    else if ((ReturnCode = EEFS_NandResolve(InodeTable, Filename, &Entry, &Slot)) == EEFS_SUCCESS) {
+    else if ((ReturnCode = EEFS_NandResolve(InodeTable, Filename, &Entry, &Slot, NULL)) == EEFS_SUCCESS) {
         E = &InodeTable->Working.Entry[Entry];
         memset(StatBuffer, 0, sizeof(EEFS_Stat_t));
         StatBuffer->InodeIndex = Entry;
@@ -990,7 +1010,7 @@ int32 EEFS_LibVerifyFile(EEFS_InodeTable_t *InodeTable, char *Name)
     if (EEFS_NandIsMounted(InodeTable) == FALSE) {
         ReturnCode = EEFS_INVALID_ARGUMENT;
     }
-    else if ((ReturnCode = EEFS_NandResolve(InodeTable, Name, &Entry, &Slot)) == EEFS_SUCCESS) {
+    else if ((ReturnCode = EEFS_NandResolve(InodeTable, Name, &Entry, &Slot, NULL)) == EEFS_SUCCESS) {
         ReturnCode = EEFS_NandValidateSlotP0(InodeTable, Entry, Slot, TRUE, &P);
     }
     EEFS_LIB_UNLOCK;
@@ -1017,7 +1037,7 @@ int32 EEFS_LibGetFileInfo(EEFS_InodeTable_t *InodeTable, char *Name, EEFS_NandFi
     if (EEFS_NandIsMounted(InodeTable) == FALSE) {
         ReturnCode = EEFS_INVALID_ARGUMENT;
     }
-    else if ((ReturnCode = EEFS_NandResolve(InodeTable, Name, &Entry, &Slot)) == EEFS_SUCCESS) {
+    else if ((ReturnCode = EEFS_NandResolve(InodeTable, Name, &Entry, &Slot, NULL)) == EEFS_SUCCESS) {
         E = &InodeTable->Working.Entry[Entry];
         memset(Info, 0, sizeof(EEFS_NandFileInfo_t));
         strncpy(Info->Path, E->Path, EEFS_NAND_MAX_PATH_SIZE - 1);
@@ -1125,91 +1145,227 @@ int32 EEFS_LibGetVolumeInfo(EEFS_InodeTable_t *InodeTable, EEFS_NandVolumeInfo_t
 
 } /* End of EEFS_LibGetVolumeInfo() */
 
-/* A/B setters (section 7.2).  Not implemented yet (phase 5). */
+/* Selects the active slot of an A/B file (section 7.2).  Switching clears ActiveFailed. */
 int32 EEFS_LibSetActiveSlot(EEFS_InodeTable_t *InodeTable, char *Name, uint8 Slot)
 {
-    (void)Slot;
+    EEFS_NandEntry_t   *E;
+    int32               i;
+    int32               ReturnCode;
 
-    if ((InodeTable == NULL) || (Name == NULL)) {
+    if ((InodeTable == NULL) || (Name == NULL) || (Slot > EEFS_NAND_SLOT_B)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((ReturnCode = EEFS_NandFindABEntry(InodeTable, Name, &i)) == EEFS_SUCCESS) {
+        E = &InodeTable->Working.Entry[i];
+        if (E->Slot[Slot].InUse == 0) {
+            ReturnCode = EEFS_FILE_NOT_FOUND;
+        }
+        else {
+            E->ActiveSlot = Slot;
+            E->ActiveFailed = 0;
+            ReturnCode = EEFS_NandAfterChange(InodeTable);
+        }
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibSetActiveSlot() */
 
+/* Selects slot Slot for every A/B file that has it.  Returns the number of entries set. */
 int32 EEFS_LibSetActiveSlotAll(EEFS_InodeTable_t *InodeTable, uint8 Slot)
 {
-    (void)Slot;
+    EEFS_NandEntry_t   *E;
+    uint32              i;
+    int32               Count = 0;
+    int32               ReturnCode;
 
-    if (InodeTable == NULL) {
+    if ((InodeTable == NULL) || (Slot > EEFS_NAND_SLOT_B)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((ReturnCode = EEFS_NandCheckWritable(InodeTable)) == EEFS_SUCCESS) {
+        for (i = 0; i < EEFS_MAX_FILES; i++) {
+            E = &InodeTable->Working.Entry[i];
+            if ((E->InUse != 0) && (E->IsAB != 0) && (E->Slot[Slot].InUse != 0)) {
+                E->ActiveSlot = Slot;
+                E->ActiveFailed = 0;
+                Count++;
+            }
+        }
+        ReturnCode = (Count > 0) ? EEFS_NandAfterChange(InodeTable) : EEFS_SUCCESS;
+        if (ReturnCode == EEFS_SUCCESS) {
+            ReturnCode = Count;
+        }
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibSetActiveSlotAll() */
 
+/* Sets the compatible-fallback flag of an A/B file (any non-zero Flag is stored as 1) */
 int32 EEFS_LibSetFallbackCompatible(EEFS_InodeTable_t *InodeTable, char *Name, uint8 Flag)
 {
-    (void)Flag;
+    int32   i;
+    int32   ReturnCode;
 
     if ((InodeTable == NULL) || (Name == NULL)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((ReturnCode = EEFS_NandFindABEntry(InodeTable, Name, &i)) == EEFS_SUCCESS) {
+        InodeTable->Working.Entry[i].FallbackCompatible = (uint8)((Flag != 0) ? 1 : 0);
+        ReturnCode = EEFS_NandAfterChange(InodeTable);
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibSetFallbackCompatible() */
 
+/* Sets the compatible-fallback flag of every A/B file.  Returns the number of entries set. */
 int32 EEFS_LibSetFallbackCompatibleAll(EEFS_InodeTable_t *InodeTable, uint8 Flag)
 {
-    (void)Flag;
+    EEFS_NandEntry_t   *E;
+    uint32              i;
+    int32               Count = 0;
+    int32               ReturnCode;
 
     if (InodeTable == NULL) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((ReturnCode = EEFS_NandCheckWritable(InodeTable)) == EEFS_SUCCESS) {
+        for (i = 0; i < EEFS_MAX_FILES; i++) {
+            E = &InodeTable->Working.Entry[i];
+            if ((E->InUse != 0) && (E->IsAB != 0)) {
+                E->FallbackCompatible = (uint8)((Flag != 0) ? 1 : 0);
+                Count++;
+            }
+        }
+        ReturnCode = (Count > 0) ? EEFS_NandAfterChange(InodeTable) : EEFS_SUCCESS;
+        if (ReturnCode == EEFS_SUCCESS) {
+            ReturnCode = Count;
+        }
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibSetFallbackCompatibleAll() */
 
+/* Records that the active copy of an A/B file failed (what the application calls after the bootloader reported
+ * ActiveFailed) */
 int32 EEFS_LibSetFailed(EEFS_InodeTable_t *InodeTable, char *Name)
 {
+    int32   i;
+    int32   ReturnCode;
+
     if ((InodeTable == NULL) || (Name == NULL)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((ReturnCode = EEFS_NandFindABEntry(InodeTable, Name, &i)) == EEFS_SUCCESS) {
+        InodeTable->Working.Entry[i].ActiveFailed = 1;
+        ReturnCode = EEFS_NandAfterChange(InodeTable);
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibSetFailed() */
 
+/* Clears the failed flag of an A/B file */
 int32 EEFS_LibClearFailed(EEFS_InodeTable_t *InodeTable, char *Name)
 {
+    int32   i;
+    int32   ReturnCode;
+
     if ((InodeTable == NULL) || (Name == NULL)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((ReturnCode = EEFS_NandFindABEntry(InodeTable, Name, &i)) == EEFS_SUCCESS) {
+        InodeTable->Working.Entry[i].ActiveFailed = 0;
+        ReturnCode = EEFS_NandAfterChange(InodeTable);
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibClearFailed() */
 
-/* Copies one slot of a file into the other (section 7.4).  Not implemented yet (phase 5). */
+/* Copies one slot of a file into the other slot's own blocks (section 7.4) */
 int32 EEFS_LibCopySlot(EEFS_InodeTable_t *InodeTable, char *Name, uint8 From, uint8 To)
 {
-    (void)From;
-    (void)To;
+    char                Path[EEFS_NAND_MAX_PATH_SIZE];
+    uint8               Spec;
+    int32               i;
+    int32               ReturnCode;
 
-    if ((InodeTable == NULL) || (Name == NULL)) {
+    if ((InodeTable == NULL) || (Name == NULL) || (From > EEFS_NAND_SLOT_B) || (To > EEFS_NAND_SLOT_B) || (From == To)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((ReturnCode = EEFS_NandCheckWritable(InodeTable)) != EEFS_SUCCESS) {
+        /* not mounted or write protected */
+    }
+    else if ((EEFS_NandParseName(Name, Path, &Spec) != EEFS_SUCCESS) || (Spec != EEFS_NAND_SLOT_NONE)) {
+        ReturnCode = EEFS_INVALID_ARGUMENT;
+    }
+    else if ((i = EEFS_NandFindEntry(InodeTable, Path)) < 0) {
+        ReturnCode = EEFS_FILE_NOT_FOUND;
+    }
+    else if ((ReturnCode = EEFS_NandCopySlotLocked(InodeTable, (uint32)i, From, To)) == EEFS_SUCCESS) {
+        ReturnCode = EEFS_NandAfterChange(InodeTable);
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibCopySlot() */
 
+/* CopySlot for every A/B file with slot From in use (entry order).  Stops at the first error and returns it (the copies
+ * already made stay in Working); otherwise returns the number of copies. */
 int32 EEFS_LibCopySlotAll(EEFS_InodeTable_t *InodeTable, uint8 From, uint8 To)
 {
-    (void)From;
-    (void)To;
+    EEFS_NandEntry_t   *E;
+    uint32              i;
+    int32               Count = 0;
+    int32               ReturnCode;
 
-    if (InodeTable == NULL) {
+    if ((InodeTable == NULL) || (From > EEFS_NAND_SLOT_B) || (To > EEFS_NAND_SLOT_B) || (From == To)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((ReturnCode = EEFS_NandCheckWritable(InodeTable)) == EEFS_SUCCESS) {
+        for (i = 0; i < EEFS_MAX_FILES; i++) {
+            E = &InodeTable->Working.Entry[i];
+            if ((E->InUse == 0) || (E->IsAB == 0) || (E->Slot[From].InUse == 0)) {
+                continue;
+            }
+            if ((ReturnCode = EEFS_NandCopySlotLocked(InodeTable, i, From, To)) != EEFS_SUCCESS) {
+                break;
+            }
+            Count++;
+        }
+        if (Count > 0) {
+            EEFS_NandTouch(InodeTable);
+        }
+#if EEFS_NAND_AUTO_COMMIT
+        if ((ReturnCode == EEFS_SUCCESS) && (Count > 0)) {
+            ReturnCode = EEFS_NandCommit(InodeTable, FALSE);
+        }
+#endif
+        if (ReturnCode == EEFS_SUCCESS) {
+            ReturnCode = Count;
+        }
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibCopySlotAll() */
 
@@ -1476,15 +1632,23 @@ int32 EEFS_NandWriteCopy(EEFS_InodeTable_t *Vol, uint32 SrcEntry, uint8 SrcSlot,
     int32                   Status;
     uint8                   Owner;
 
-    Status = EEFS_NandReadSlotPage0(Vol, SrcEntry, SrcSlot, &SrcP, &Raw);
-    if (Status != EEFS_SUCCESS) {
-        return(Status);
-    }
-    if ((SrcP.BlockCount != NewP0->BlockCount) || (SrcP.FileSize != NewP0->FileSize) ||
-        (SrcP.BlockCount > EEFS_NAND_MAX_FILE_BLOCKS) || (Vol->Working.Map[DstBlocks[0]] == EEFS_NAND_MAP_BAD)) {
+    Owner = Vol->Working.Map[DstBlocks[0]];
+    if ((NewP0->BlockCount > EEFS_NAND_MAX_FILE_BLOCKS) || (EEFS_NAND_MAP_IS_OWNER(Owner) == FALSE)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    Owner = Vol->Working.Map[DstBlocks[0]];
+    Status = EEFS_NandReadSlotPage0(Vol, SrcEntry, SrcSlot, &SrcP, &Raw);
+    if ((Status == EEFS_SUCCESS) &&
+        ((SrcP.BlockCount != NewP0->BlockCount) || (SrcP.FileSize != NewP0->FileSize))) {
+        Status = EEFS_INVALID_ARGUMENT;
+    }
+    if (Status != EEFS_SUCCESS) {
+        for (k = 0; k < NewP0->BlockCount; k++) {      /* nothing was written: give the destination blocks back */
+            if (Vol->Working.Map[DstBlocks[k]] == Owner) {
+                EEFS_NandReleaseBlocks(Vol, &DstBlocks[k], 1);
+            }
+        }
+        return(Status);
+    }
     for (k = 0; k < SrcP.BlockCount; k++) {
         EEFS_NandPage0Block(Raw, k, &EEFS_NandJobSrc[k], &Crc);
         EEFS_NandJobCrcs[k] = Crc;
@@ -1612,8 +1776,9 @@ static boolean EEFS_NandBlockBytesEqual(EEFS_InodeTable_t *Vol, uint16 OldBlock,
 } /* End of EEFS_NandBlockBytesEqual() */
 
 /* Name -> (entry, slot) for Open/Stat/GetFileInfo/VerifyFile (section 6.1): an explicit slot, else the active slot of an
- * A/B entry, else A.  The slot must be in use.  No fallback. */
-static int32 EEFS_NandResolve(EEFS_InodeTable_t *Vol, char *Name, uint32 *Entry, uint8 *Slot)
+ * A/B entry, else A.  The slot must be in use.  No fallback (Open applies it, section 7.3).  *SlotSpec (may be NULL)
+ * receives the name's suffix. */
+static int32 EEFS_NandResolve(EEFS_InodeTable_t *Vol, char *Name, uint32 *Entry, uint8 *Slot, uint8 *SlotSpec)
 {
     char                Path[EEFS_NAND_MAX_PATH_SIZE];
     const EEFS_NandEntry_t *E;
@@ -1627,6 +1792,9 @@ static int32 EEFS_NandResolve(EEFS_InodeTable_t *Vol, char *Name, uint32 *Entry,
         return(EEFS_FILE_NOT_FOUND);
     }
     E = &Vol->Working.Entry[i];
+    if (SlotSpec != NULL) {
+        *SlotSpec = Spec;
+    }
     if (Spec != EEFS_NAND_SLOT_NONE) {
         *Slot = Spec;
     }
@@ -2210,6 +2378,125 @@ static int32 EEFS_NandRewriteFirstBlocks(EEFS_InodeTable_t *Vol, uint32 Entry, c
     return(EEFS_SUCCESS);
 
 } /* End of EEFS_NandRewriteFirstBlocks() */
+
+/* Mounted and not write protected: EEFS_SUCCESS, EEFS_INVALID_ARGUMENT or EEFS_READ_ONLY_FILE_SYSTEM */
+static int32 EEFS_NandCheckWritable(EEFS_InodeTable_t *Vol)
+{
+    if (EEFS_NandIsMounted(Vol) == FALSE) {
+        return(EEFS_INVALID_ARGUMENT);
+    }
+    if (EEFS_LIB_IS_WRITE_PROTECTED != FALSE) {
+        return(EEFS_READ_ONLY_FILE_SYSTEM);
+    }
+    return(EEFS_SUCCESS);
+
+} /* End of EEFS_NandCheckWritable() */
+
+/* The entry of an A/B setter (section 7.2): a name without suffix (else EEFS_INVALID_ARGUMENT), an entry in use (else
+ * EEFS_FILE_NOT_FOUND) that is IsAB (else EEFS_INVALID_ARGUMENT); the volume mounted and writable */
+static int32 EEFS_NandFindABEntry(EEFS_InodeTable_t *Vol, char *Name, int32 *Entry)
+{
+    char    Path[EEFS_NAND_MAX_PATH_SIZE];
+    uint8   Spec;
+    int32   Status;
+
+    if ((Status = EEFS_NandCheckWritable(Vol)) != EEFS_SUCCESS) {
+        return(Status);
+    }
+    if ((EEFS_NandParseName(Name, Path, &Spec) != EEFS_SUCCESS) || (Spec != EEFS_NAND_SLOT_NONE)) {
+        return(EEFS_INVALID_ARGUMENT);
+    }
+    if ((*Entry = EEFS_NandFindEntry(Vol, Path)) < 0) {
+        return(EEFS_FILE_NOT_FOUND);
+    }
+    if (Vol->Working.Entry[*Entry].IsAB == 0) {
+        return(EEFS_INVALID_ARGUMENT);
+    }
+    return(EEFS_SUCCESS);
+
+} /* End of EEFS_NandFindABEntry() */
+
+/* CopySlot of entry Entry under the lock (section 7.4), without the final Touch/commit.  The destination gets its own
+ * freshly allocated blocks (EEFS_NAND_ALLOC_NEW), so A and B never share a block; a destination copy that was in use
+ * becomes FREEING (its first block goes on the cleanup list) and is erased only after the commit. */
+static int32 EEFS_NandCopySlotLocked(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 From, uint8 To)
+{
+    EEFS_NandEntry_t   *E = &Vol->Working.Entry[Entry];
+    EEFS_NandSlot_t    *S = &E->Slot[To];
+    EEFS_NandPage0_t   *P = &EEFS_NandJobP0;
+    boolean             Replace;
+    uint16              OldFirst;
+    int32               Status;
+
+    if ((E->IsAB == 0) && ((From != EEFS_NAND_SLOT_A) || (E->Slot[To].InUse != 0))) {
+        return(EEFS_INVALID_ARGUMENT);      /* a single-copy file can only opt in by copying A into B */
+    }
+    if (E->Slot[From].InUse == 0) {
+        return(EEFS_FILE_NOT_FOUND);
+    }
+    if (((E->Attributes & EEFS_ATTRIBUTE_READONLY) != 0) || (EEFS_NandIsOpen(Vol, Entry, To) == TRUE)) {
+        return(EEFS_PERMISSION_DENIED);
+    }
+    if (Vol->PendingCleanupBase > 0) {
+        EEFS_NandRunPendingCleanup(Vol);
+    }
+    Replace = (boolean)(S->InUse != 0);
+    if ((Replace == TRUE) && (EEFS_NandCleanupHasRoom(Vol, 1) == FALSE)) {
+        return(EEFS_TRANSACTION_ERROR);
+    }
+
+    /* the source's metadata page, re-addressed to the destination slot */
+    Status = EEFS_NandReadSlotPage0(Vol, Entry, From, P, NULL);
+    if ((Status == EEFS_SUCCESS) && (P->BlockCount > EEFS_NAND_MAX_FILE_BLOCKS)) {
+        Status = EEFS_CORRUPT_FILE;
+    }
+    if (Status != EEFS_SUCCESS) {
+        EEFS_NandSlotFailed(Vol, Entry, From);
+        return(Status);
+    }
+    P->Slot = To;
+
+    /* the destination's own blocks, then the copy (blocks 1..n-1, then the first block) */
+    Status = EEFS_NandAllocBlocks(Vol, P->BlockCount, EEFS_NandJobBlocks, EEFS_NAND_MAP_OWNER(Entry, To),
+                                  EEFS_NAND_ALLOC_NEW);
+    if (Status != EEFS_SUCCESS) {
+        return(Status);
+    }
+    Status = EEFS_NandWriteCopy(Vol, Entry, From, P, EEFS_NandJobBlocks);
+    if (Status != EEFS_SUCCESS) {
+        if (Status == EEFS_CORRUPT_FILE) {
+            EEFS_NandSlotFailed(Vol, Entry, From);
+        }
+        return(Status);         /* WriteCopy released the new blocks; the destination is unchanged */
+    }
+
+    /* the old destination copy (if any) is freed in the batch; the new one becomes the slot */
+    if (Replace == TRUE) {
+        OldFirst = S->FirstBlock;
+        EEFS_NandFreeBlocksExcept(Vol, Entry, To, EEFS_NandJobBlocks, P->BlockCount);
+        (void)EEFS_NandAddCleanup(Vol, OldFirst);   /* room was checked above */
+    }
+    S->InUse = 1;
+    S->Reserved = 0;
+    S->FirstBlock = EEFS_NandJobBlocks[0];
+    S->AllocBlocks = (uint16)P->BlockCount;
+    S->Reserved2 = 0;
+    S->FileSize = P->FileSize;
+    S->Version = P->Version;
+    S->WriteSeq = P->WriteSeq;
+    S->FileCrc32 = P->FileCrc32;
+    S->ModificationDate = P->ModificationDate;
+    if (E->IsAB == 0) {
+        E->IsAB = 1;            /* opted in; A stays the active slot */
+        E->ActiveSlot = EEFS_NAND_SLOT_A;
+    }
+    if (E->ActiveSlot == To) {
+        E->ActiveFailed = 0;    /* the active copy was repaired */
+    }
+    Vol->SlotFlags[Entry][To] = 0;
+    return(EEFS_SUCCESS);
+
+} /* End of EEFS_NandCopySlotLocked() */
 
 /* Common tail of every mutating call: Touch, and the commit when EEFS_NAND_AUTO_COMMIT is set */
 static int32 EEFS_NandAfterChange(EEFS_InodeTable_t *Vol)
