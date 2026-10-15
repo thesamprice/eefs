@@ -1,0 +1,7 @@
+Offset	Size	Section	Slot	Filename	File Size	Spare	Max Size	Crc	Attributes
+0	536	FAT
+536	64	Header	0
+600	52	Data	0	hello.txt	34	18	52	0x000066AD	0
+652	64	Header	1
+716	3000	Data	1	pattern.bin	3000	0	3000	0x00000B12	1
+3716	61820	Free

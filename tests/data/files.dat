@@ -1,0 +1,7 @@
+!
+! geneepromfs input for the CMake tests
+!
+! Input Filename       EEFS Filename     Spare Bytes   Attributes
+!---------------------------------------------------------------------------------
+  hello.txt,           hello.txt,        16,           EEFS_ATTRIBUTE_NONE;
+  pattern.bin,         pattern.bin,      0,            EEFS_ATTRIBUTE_READONLY;
