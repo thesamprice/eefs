@@ -1258,13 +1258,7 @@ static void ab_rebuild_recovers_locations_versions(void)
     CHECK_RC(MicroEEFS_NandLoadFile(&V_Dev, A_PageBuf, "/f@B", V_Read, V_BUF_SIZE, &Info), EEFS_SUCCESS);
     CHECK(memcmp(V_Read, V_Content(&A_F2), A_F2.Size) == 0);
 
-    /* the library: mount rebuilds (phase 4) */
-    memset(&V_Aux, 0, sizeof(V_Aux));
-    if (EEFS_LibRebuildDirectory(&V_Aux) == EEFS_UNSUPPORTED_OPTION) {
-        printf("    library rebuild not available yet (phase 4): checked the bootloader scan only\n");
-        V_Destroy();
-        return;
-    }
+    /* the library: mount rebuilds the directory from page 0s */
     Status = V_Mount(&V_Vol);
     CHECK_RC(Status, EEFS_SUCCESS);
     if (Status == EEFS_SUCCESS) {

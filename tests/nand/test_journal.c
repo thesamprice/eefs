@@ -853,8 +853,10 @@ static void format_fails_with_one_good_block_in_mirror(void)
 }
 
 /* Format of a device that holds a volume, cut at every program and erase (on a 64-block device to keep it short):
- * the device mounts as the old volume, as NOT_FORMATTED, or as the new empty volume, in that order, and can always be
- * formatted again. */
+ * the device mounts as the old volume, as a directory rebuilt from the old metadata pages (phase 4: the directory
+ * region is erased but some old page 0s are not yet; the synthetic files of this test have no data, so their pages
+ * fail the first-block CRC and the rebuilt directory is empty), as NOT_FORMATTED, or as the new empty volume, in that
+ * order, and can always be formatted again. */
 static void powercut_sweep_format(void)
 {
     EEFS_NandGeometry_t Geo = NandTest_Geo;
@@ -894,7 +896,7 @@ static void powercut_sweep_format(void)
 
             Status = J_Mount(&J_Vol);
             if (Status == EEFS_NOT_FORMATTED) {
-                Phase = 1;
+                Phase = 2;
             }
             else {
                 CHECK_RC(Status, EEFS_SUCCESS);
@@ -902,16 +904,20 @@ static void powercut_sweep_format(void)
                 if (J_Same(&J_Cur, &J_Pre)) {
                     Phase = 0;
                 }
+                else if (J_Vol.DirectoryRebuilt) {
+                    Phase = 1;
+                    CHECK_EQ(J_EntriesInUse(&J_Vol), 0);
+                }
                 else {
-                    Phase = 2;
+                    Phase = 3;
                     CHECK_EQ(J_EntriesInUse(&J_Vol), 0);
                     CHECK_EQ(J_Vol.LastSeq, 1);
                 }
             }
             CHECK(Phase >= Last);
-            if (Done) CHECK_EQ(Phase, 2);
+            if (Done) CHECK_EQ(Phase, 3);
             Last = Phase;
-            if (Phase == 2) {
+            if ((Phase == 1) || (Phase == 3)) {
                 CHECK_RC(J_TouchCommit(&J_Vol, J_FOLLOW_ENTRY), EEFS_SUCCESS);
                 J_CheckMirrorsAgree(&J_Vol);
             }

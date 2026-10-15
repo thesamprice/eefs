@@ -595,6 +595,7 @@ static void micro_scan_fallback_when_no_directory(void)
     EEFS_NandSlot_t         S3;
     uint32                  Dir = NandTest_Geo.DirRegionBlocks;
     uint32                  m;
+    uint16                  Blk1;
 
     /* blank device */
     Fx_Blank(&F);
@@ -630,9 +631,12 @@ static void micro_scan_fallback_when_no_directory(void)
     Fx_WriteCopy(&F, "/s/bonly", EEFS_NAND_SLOT_B, EEFS_FILE_TYPE_OTHER, 5, NULL, Data2, 777, NULL);
     Fx_WriteCopy(&F, "/s/ab", EEFS_NAND_SLOT_A, EEFS_FILE_TYPE_OTHER, 6, NULL, Data, 888, NULL);
     Fx_WriteCopy(&F, "/s/ab", EEFS_NAND_SLOT_B, EEFS_FILE_TYPE_OTHER, 7, NULL, Data2, 999, NULL);
-    Fx_WriteCopy(&F, "/s/abbad", EEFS_NAND_SLOT_A, EEFS_FILE_TYPE_OTHER, 6, NULL, Data, 888, &S1);
+    /* A spans two blocks; its second block is damaged (a damaged first block would make the scan reject the copy) */
+    Fx_WriteCopy(&F, "/s/abbad", EEFS_NAND_SLOT_A, EEFS_FILE_TYPE_OTHER, 6, NULL, Data, T_D0() + 888, &S1);
     Fx_WriteCopy(&F, "/s/abbad", EEFS_NAND_SLOT_B, EEFS_FILE_TYPE_OTHER, 7, NULL, Data2, 999, NULL);
-    NandSim_CorruptBytes(F.Sim, S1.FirstBlock, 1, 0, 1);
+    Fx_RawPage(&F, S1.FirstBlock, 0, Raw);
+    EEFS_NandPage0Block(Raw, 1, &Blk1, NULL);
+    NandSim_CorruptBytes(F.Sim, Blk1, 0, 0, 1);
 
     /* the directory never heard of these files: it is valid, so no scan */
     CHECK_RC(T_Find("/s/a", &Info), EEFS_FILE_NOT_FOUND);
@@ -1427,6 +1431,61 @@ static void micro_matches_library_state(void)
     V_Destroy();
 }
 
+/* Scan fallback: a page 0 whose own block's data is incomplete (a rewrite cut after page 0, before the first block's
+ * data pages) loses to the older complete copy, although its WriteSeq is higher */
+static void micro_scan_rejects_torn_first_block(void)
+{
+    MicroEEFS_NandInfo_t    Info;
+    EEFS_NandPage0_t        P;
+    V_File_t                Old;
+    V_File_t                New;
+    uint32                  Dir = NandTest_Geo.DirRegionBlocks;
+    uint32                  OldFirst;
+    uint32                  Torn = 0;
+    uint32                  b;
+
+    memset(&Old, 0, sizeof(Old));
+    Old.Path = "/boot/image";
+    Old.Size = (3 * NandTest_Geo.PageSize) + 100;   /* one block, four data pages */
+    Old.Seed = 801;
+    New = Old;
+    New.Mod[New.ModCount++] = 10;
+
+    V_NewVolume();
+    CHECK_RC(V_Write(&Old), EEFS_SUCCESS);
+    CHECK_RC(EEFS_LibCommit(&V_Vol), EEFS_SUCCESS);
+    OldFirst = V_SlotA(&V_Vol, Old.Path)->FirstBlock;
+
+    /* the rewrite: erase of the new block, its page 0, its first data page, then the power fails */
+    NandSim_SetPowerBudget(V_Sim, 3, NANDSIM_TORN_NONE);
+    CHECK(V_Write(&New) != EEFS_SUCCESS);
+    CHECK(NandSim_PowerCutHappened(V_Sim));
+    NandSim_Reboot(V_Sim);
+    for (b = Dir; b < NandTest_Geo.BlockCount; b++) {
+        if ((b == OldFirst) || !NandSim_PageIsProgrammed(V_Sim, b, 0)) continue;
+        NandSim_RawRead(V_Sim, b, 0, Raw, NULL);
+        if ((EEFS_NandDecodePage0(Raw, NandTest_Geo.PageSize, NandTest_Geo.PagesPerBlock, b, &P) == EEFS_SUCCESS) &&
+            (strcmp(P.Path, Old.Path) == 0)) {
+            Torn = b;
+        }
+    }
+    CHECK(Torn != 0);                                   /* a complete, newer metadata page ... */
+    CHECK(NandSim_PageIsProgrammed(V_Sim, Torn, 1));
+    CHECK(NandSim_PageIsErased(V_Sim, Torn, 2));        /* ... over an incomplete block */
+
+    /* no directory: the scan must load the committed copy */
+    for (b = 0; b < Dir; b++) {
+        NandSim_RawErase(V_Sim, b);
+    }
+    T_PrepBuffers();
+    CHECK_RC(MicroEEFS_NandLoadFile(&V_Dev, PageBuf, Old.Path, Dest, T_DEST_SIZE, &Info), EEFS_SUCCESS);
+    CHECK_EQ(Info.UsedScan, 1);
+    CHECK_EQ(Info.LoadedSlot, EEFS_NAND_SLOT_A);
+    CHECK_EQ(Info.Info.SlotInfo[0].FirstBlock, OldFirst);
+    CHECK(memcmp(Dest, V_Content(&Old), Old.Size) == 0);
+    V_Destroy();
+}
+
 /* Argument and geometry validation */
 static void micro_invalid_arguments(void)
 {
@@ -1497,6 +1556,7 @@ const NandTest_Case_t NandTest_MicroCases[] = {
     { "micro_bad_directory_blocks",                                 micro_bad_directory_blocks },
     { "micro_invalid_arguments",                                    micro_invalid_arguments },
     { "micro_matches_library_state",                                micro_matches_library_state },
+    { "micro_scan_rejects_torn_first_block",                        micro_scan_rejects_torn_first_block },
     { NULL,                                                         NULL }
 };
 
