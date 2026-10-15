@@ -1054,7 +1054,9 @@ if any open descriptor refers to (i,s) whose Working slot differs from Base slot
 for each (i,s) with Working.Entry[i].Slot[s].InUse and Working FirstBlock != Base FirstBlock (slot created or rewritten in the batch):
     best effort: erase Working FirstBlock only (its page 0 would otherwise be an orphan); failure -> MarkBad.
     Never touch the other blocks of the slot: with copy-on-write they may be shared with the committed copy.
-    (As delivered: only when FirstBlock is a data block that is FREE in Base and not BAD, and its page 0 is not erased.)
+    (As delivered: only when FirstBlock is a data block that is FREE in Base and not BAD, and its page 0 is not erased.
+    Phase 3 adds the same erase for the batch's own cleanup-list entries that are FREE in Base and FREEING in Working:
+    first blocks the batch created and then superseded itself.)
 for each b: if Working.Map[b] == BAD: keep; else Working.Map[b] = Base.Map[b]
 Working.Entry[] = Base.Entry[]; Working.WriteSeqHigh = Base.WriteSeqHigh
 PendingCleanupCount = count loaded at mount or left by the last commit that is still pending (i.e. remove entries added during the batch: the list is kept as [mount-pending | batch-added], tracked by PendingCleanupBase index)
@@ -1092,7 +1094,9 @@ clean commit nothing is pending. Mount never runs it.
 
 A stored path of 255 characters is the maximum (`strlen < EEFS_NAND_MAX_PATH_SIZE`); the suffix
 is not stored. Paths must begin with `/`; no other validation (the volume is flat: `/cf/apps/x.so`
-is one name and `/cf` is not a directory).
+is one name and `/cf` is not a directory). As delivered, `@` is reserved: after a trailing `@A`/`@B`
+is removed, a path that still contains `@` is `EEFS_INVALID_ARGUMENT` (this is what "a second `@`"
+means, and it also rejects unknown suffixes such as `@C` or `@a`).
 
 ### 6.2 Copy-on-write rule (user decision, 2026-10-15)
 
@@ -1128,7 +1132,8 @@ reserve rule, 6.9) does not cover the new first block plus the changed blocks, t
  2. RunPendingCleanup if needed.
  3. Resolve entry i (FindEntry or AllocEntry) and slot s (6.1). Existing entry with READONLY attribute -> EEFS_PERMISSION_DENIED
     (write a new entry instead). Any open descriptor on (i, s) -> EEFS_PERMISSION_DENIED.
- 4. Need = EEFS_NandBlocksNeeded(Size). Need > MaxBlocksPerFile or Size > max file size -> EEFS_NO_SPACE_LEFT_ON_DEVICE.
+ 4. Need = EEFS_NandBlocksNeeded(Size). Need > MaxBlocksPerFile (a size no metadata page can describe) -> EEFS_INVALID_ARGUMENT
+    (as delivered, matching the return list of 2.6; a file that merely does not fit the free space is NO_SPACE in step 5).
     Mode = slot in use ? MODIFY : NEW. MODIFY needs cleanup room for 1 block (EEFS_NandCleanupHasRoom) else EEFS_TRANSACTION_ERROR.
  5. Build the position table Pos[0..Need-1], each {Block, Kept}:
       NEW:    all positions new.
@@ -1173,9 +1178,13 @@ CRC match are read), one erase + the data pages of every changed block, and one 
 
 Power loss during step 6 (NEW or MODIFY): directory unchanged; the old copy, if any, is intact
 because none of its blocks was erased or programmed; the new blocks are free in the committed map;
-possibly an orphan page 0 (position 0 is written last, so the orphan exists only if the data was
-complete) that shares the kept blocks with the live copy, which a rebuild resolves by the overlap
-rule (8.1). Power loss after the commit but before the cleanup erase: the new copy is live and
+possibly an orphan page 0 that shares the kept blocks with the live copy, which a rebuild resolves by
+the overlap rule (8.1). Position 0 is written last, so such an orphan exists only if every other new
+block is complete; the first block's own data pages, however, follow its page 0 (pages are programmed
+in ascending order), so an orphan's first block may be incomplete. A rebuild therefore checks
+`Blocks[0].Crc32` before it accepts a candidate (8.1). The `powercut` sweeps assert this invariant
+after every cut: no metadata page on the device lists a block at position >= 1 whose data does not
+match its CRC. Power loss after the commit but before the cleanup erase: the new copy is live and
 the old first block is on the pending cleanup list (5.6).
 
 A/B: writing the inactive slot is the same procedure; A and B never share blocks (CopySlot copies
@@ -1237,6 +1246,10 @@ Common:
     Rename: Entry.Path = New.  SetAttr: Entry.Attributes = Attr.
     Touch; AUTO_COMMIT.
 ```
+
+As delivered: `SetFileAttributes` with the value the entry already has returns `EEFS_SUCCESS` and
+writes nothing. A copy-source CRC mismatch is `EEFS_CORRUPT_FILE` (the source slot is flagged), and a
+missing replacement block is reported as `EEFS_IO_ERROR`, as in 7.5.
 
 Power loss: before the commit the old first block is intact and the directory still names it, so
 the file is unchanged; after the commit the new first block is authoritative and the cleanup erase
@@ -1383,6 +1396,8 @@ optimize inside its `ProgramPage`.
 ```
 pass 1: for b in [DirRegionBlocks, BlockCount): if Working.Map[b] == BAD skip;
         read page 0 + OOB (uncached). OOB marker set -> Map[b] = BAD, continue. ReadPage0 invalid -> continue.
+        The data pages of b (Blocks[0]) do not match Blocks[0].Crc32 -> continue (an interrupted write: page 0
+        precedes the first block's own data pages; every other block of a candidate is complete, 6.3).
         slot = P0.Slot in {A,B} ? P0.Slot : A. Find entry with Path (linear search of a scratch table of EEFS_MAX_FILES {Path, Winner[2] = {Block, WriteSeq, Explicit}});
         new path: take a free row, or ignore if full. If Winner[slot] empty or P0.WriteSeq > Winner.WriteSeq: Winner = (b, WriteSeq, P0.Slot != NONE).
         MaxPageWriteSeq = max(...).
@@ -1924,6 +1939,45 @@ by the next commit).
 Done when: `nand_fileops_*`, `nand_powercut_*`, `nand_default_config_4096`,
 `nand_verify_on_open_4096` pass; `eeprom` unchanged.
 
+As delivered: all the cases above, plus `cow_modify_rewrites_decayed_block` (a kept candidate whose
+bytes decayed on the media while its CRC still matches the intended content is rewritten: the byte
+compare is what catches it), `micro_matches_library_state` in the `micro` suite (the bootloader
+library loads, byte for byte and with the library's `GetFileInfo` view, every file written by
+`EEFS_LibWriteFile` and committed, after a copy-on-write modify, a rename, a remove, an attribute
+change, grow/shrink, a re-add, ring-block changes and a remount; an uncommitted rewrite stays
+invisible to it), and these `powercut` sweeps, each over every program and erase of the operation and
+its commit, in all three torn modes: `write_new`, `modify` (6 blocks, two positions changed),
+`remove`, `rename`, `setattr`, `batch` (5 new files, 2 removes, 1 rename, 1 modify, one commit) and
+`grown_bad_program` / `grown_bad_erase` / `grown_bad_new` (a destination block fails during the write,
+is marked bad and replaced). After each cut the sweep remounts (no program or erase), requires
+exactly the pre or the post directory (monotonic in the cut point), reads every file of that state
+back byte for byte, checks that no metadata page on the device lists a position >= 1 with bad data,
+then does a follow-up write and commit and checks the cleanup, both mirrors and the files again. The
+NAND test programs are compiled with `-O2` when no `CMAKE_BUILD_TYPE` is set (the sweeps run about
+ten thousand mounts per geometry). Implementation notes for later phases:
+
+- The write job keeps its block lists in static scratch arrays sized by
+  `EEFS_NAND_MAX_FILE_BLOCKS` = `(EEFS_NAND_MAX_PAGE_SIZE - 1532) / 6` (about 4.3 KB at the defaults,
+  with two page-0 structures), shared by all volumes under `EEFS_LIB_LOCK`, which must therefore be
+  one library-wide lock (it already guards the shared descriptor table).
+- `EEFS_NandWriteCopy` is implemented for phase 5 (whole-slot copy with per-block source CRC checks;
+  it assigns `NewP0->WriteSeq` itself; `DstBlocks[]` must already be allocated for the destination).
+  Rename and SetFileAttributes use the same write job with every position except 0 kept.
+- `EEFS_NandValidateSlot` failures set `SLOTFLAG_CORRUPT` and, for the active copy of an A/B entry,
+  `ActiveFailed` in `Working` (and in `Base` when `Base` holds the same slot record) with `ForceDirty`.
+  Open does not fall back yet (phase 5).
+- A new entry written to slot B only gets `ActiveSlot = B`.
+- The allocator only takes blocks that are FREE in both `Working` and `Base`, so a block the committed
+  directory references is never handed out even if the map were inconsistent.
+- Abort also erases the first blocks the batch created and then superseded itself (they are on the
+  batch's cleanup list and FREE in `Base`), so a batch that rewrote a file twice leaves no orphan.
+- `EEFS_Crc32Update2` (CRC module) feeds the same bytes into a block CRC and a file CRC in one pass;
+  WriteFile and ValidateSlot use it.
+- The byte compare of a kept candidate reads the old block's data pages (`EEFS_NandBlockUnchanged`
+  semantics); WriteFile matches length and CRC first and does not recompute the CRC for the compare.
+- After a commit, the newest record still lists the blocks its cleanup erased; a remount reloads that
+  list and the next mutating call re-runs it, which is a no-op for erased blocks (FMT 4.3.4).
+
 ### Phase 4: rebuild
 
 Implements: `eefs_nand_rebuild.c` (8.1, 8.3), mount step 5, `EEFS_LibRebuildDirectory`, driver
@@ -2075,7 +2129,9 @@ for both backends.
    CRCs are left to the bootloader, `VerifyFile` and the health check. The option stays and is
    built and tested with it on (`nand_verify_on_open_4096`).
 10. **Write order: new blocks 1..n-1 first, the new first block (with page 0) last**, so an
-    interrupted write leaves no page 0 (no orphan) unless the data was complete.
+    interrupted write leaves no page 0 (no orphan) unless the data of every other block is complete. The
+    first block's own data pages follow its page 0 (ascending page order), so a rebuild checks
+    `Blocks[0].Crc32` of a candidate (8.1).
 11. **Page-0 `Slot` is A / B / NONE (0xFF)** and the directory's `IsAB` is set when a slot was
     ever written explicitly; rebuild sets `ActiveSlot = A if present else B` (the plan said
     always A, which would make a B-only file unopenable after a rebuild).

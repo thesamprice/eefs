@@ -105,7 +105,8 @@ int32                           EEFS_InitFS(char *DeviceName, cpuaddr BaseAddres
    to mounting it by calling EEFS_InitFS. */
 int32                           EEFS_Mount(char *DeviceName, char *MountPoint);
 
-/* Unmounts a volume by removing it from the VolumeTable. */
+/* Unmounts a volume by removing it from the VolumeTable.  NAND backend: commits the pending batch first and returns
+ * EEFS_ERROR if that commit fails (call EEFS_Abort first to drop a batch). */
 int32                           EEFS_UnMount(char *MountPoint);
 
 /* Opens the specified file for reading or writing. */

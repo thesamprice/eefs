@@ -17,8 +17,10 @@
  * Design Notes:
  *   Every FindFile/LoadFile call goes through T_Find/T_Load, which assert that the call neither programmed nor erased
  *   anything, never wrote past PageSize in the page buffer and never wrote past MaxSize in the destination.
- *   The expected values come from the fixture's own directory state (F.Entry[]), which stands in for the library's
- *   GetFileInfo until the library's writers exist (phase 3: micro_matches_library_state).
+ *   The expected values come from the fixture's own directory state (F.Entry[]).  micro_matches_library_state
+ *   (phase 3) instead builds the volume with the real library (EEFS_LibWriteFile, Commit, Rename, Remove,
+ *   SetFileAttributes, copy-on-write modifies) and checks the loader against the library's GetFileInfo and the
+ *   written bytes.
  *
  */
 
@@ -29,6 +31,7 @@
 #include "nand_test.h"
 #include "nand_fixture.h"
 #include "microeefs_nand.h"
+#include "nand_vol.h"
 
 /*
  * Macro Definitions
@@ -1236,6 +1239,194 @@ static void micro_bad_directory_blocks(void)
     Fx_Free(&F);
 }
 
+/*
+ * Cross-check with the library (phase 3)
+ */
+
+typedef struct
+{
+    V_File_t                F;
+    uint8                   FileType;
+    uint32                  Version;
+    int                     Live;           /* expected to exist in the committed directory */
+} M_File_t;
+
+static M_File_t     M_Files[8];
+static uint32       M_Count;
+
+static int32 M_Write(M_File_t *M)
+{
+    EEFS_NandFileInfo_t Meta;
+
+    V_Meta(&Meta, M->FileType, M->Version);
+    Meta.Attributes = M->F.Attributes;
+    switch (M->FileType) {
+        case EEFS_FILE_TYPE_BOOT_ELF:
+            Meta.Type.Elf.DestAddress = 0x40000000UL;
+            Meta.Type.Elf.EntryPoint = 0x40000400UL + M->Version;
+            Meta.Type.Elf.Flags = 1;
+            break;
+        case EEFS_FILE_TYPE_BOOT_DTB:
+            Meta.Type.Dtb.DestAddress = 0x1F000000UL;
+            break;
+        case EEFS_FILE_TYPE_CFS_APP:
+            strcpy(Meta.Type.App.AppName, "X_APP");
+            strcpy(Meta.Type.App.EntrySymbol, "X_AppMain");
+            Meta.Type.App.Priority = 70;
+            Meta.Type.App.StackSize = 8192;
+            break;
+        default:
+            break;
+    }
+    return(EEFS_LibWriteFile(&V_Vol, (char *)M->F.Path, &Meta, V_Content(&M->F), M->F.Size));
+}
+
+/* The loader, reading the device the library wrote, finds and loads every committed file byte for byte, with the
+ * library's view of the entry; removed and renamed-away names are not found. */
+static void M_CheckAll(void)
+{
+    MicroEEFS_NandInfo_t    Info;
+    EEFS_NandFileInfo_t     L;
+    uint32                  Programs = NandSim_Programs(V_Sim);
+    uint32                  Erases = NandSim_Erases(V_Sim);
+    uint32                  i;
+    uint32                  s;
+    int32                   Status;
+
+    for (i = 0; i < M_Count; i++) {
+        T_PrepBuffers();
+        memset(&Info, 0, sizeof(Info));
+        Status = MicroEEFS_NandLoadFile(&V_Dev, PageBuf, M_Files[i].F.Path, Dest, T_DEST_SIZE, &Info);
+        if (!M_Files[i].Live) {
+            CHECK_RC(Status, EEFS_FILE_NOT_FOUND);
+            continue;
+        }
+        CHECK_RC(Status, EEFS_SUCCESS);
+        CHECK_RC(EEFS_LibGetFileInfo(&V_Vol, (char *)M_Files[i].F.Path, &L), EEFS_SUCCESS);
+        CHECK(memcmp(Dest, V_Content(&M_Files[i].F), M_Files[i].F.Size) == 0);
+        CHECK(strcmp(Info.Info.Path, L.Path) == 0);
+        CHECK_EQ(Info.Info.FileType, L.FileType);
+        CHECK_EQ(Info.Info.Version, L.Version);
+        CHECK_EQ(Info.Info.FileSize, L.FileSize);
+        CHECK_EQ(Info.Info.FileSize, M_Files[i].F.Size);
+        CHECK_EQ(Info.Info.FileCrc32, L.FileCrc32);
+        CHECK_EQ(Info.Info.Attributes, L.Attributes);
+        CHECK_EQ(Info.Info.Attributes, M_Files[i].F.Attributes);
+        CHECK_EQ(Info.Info.CreationDate, L.CreationDate);
+        CHECK_EQ(Info.Info.IsAB, L.IsAB);
+        CHECK_EQ(Info.Info.ActiveSlot, L.ActiveSlot);
+        CHECK_EQ(Info.Info.ActiveFailed, 0);
+        CHECK_EQ(Info.LoadedSlot, EEFS_NAND_SLOT_A);
+        CHECK_EQ(Info.UsedScan, 0);
+        CHECK_EQ(Info.DirectoryValid, 1);
+        CHECK_EQ(Info.DirSeq, V_Vol.LastSeq);
+        for (s = 0; s < 2; s++) {
+            CHECK_EQ(Info.Info.SlotInfo[s].InUse, L.SlotInfo[s].InUse);
+            CHECK_EQ(Info.Info.SlotInfo[s].FirstBlock, L.SlotInfo[s].FirstBlock);
+            CHECK_EQ(Info.Info.SlotInfo[s].AllocBlocks, L.SlotInfo[s].AllocBlocks);
+            CHECK_EQ(Info.Info.SlotInfo[s].FileSize, L.SlotInfo[s].FileSize);
+            CHECK_EQ(Info.Info.SlotInfo[s].Version, L.SlotInfo[s].Version);
+            CHECK_EQ(Info.Info.SlotInfo[s].WriteSeq, L.SlotInfo[s].WriteSeq);
+            CHECK_EQ(Info.Info.SlotInfo[s].FileCrc32, L.SlotInfo[s].FileCrc32);
+            CHECK_EQ(Info.Info.SlotInfo[s].ModificationDate, L.SlotInfo[s].ModificationDate);
+        }
+        T_CheckType(&Info.Info.Type, &L.Type, L.FileType);
+    }
+    CHECK_EQ(NandSim_Programs(V_Sim), Programs);
+    CHECK_EQ(NandSim_Erases(V_Sim), Erases);
+}
+
+static M_File_t M_Make(const char *Path, uint32 Size, uint32 Seed, uint8 FileType, uint32 Version)
+{
+    M_File_t    M;
+
+    memset(&M, 0, sizeof(M));
+    M.F.Path = Path;
+    M.F.Size = Size;
+    M.F.Seed = Seed;
+    M.FileType = FileType;
+    M.Version = Version;
+    M.Live = 1;
+    return(M);
+}
+
+static void micro_matches_library_state(void)
+{
+    uint32  BB = NandTest_Geo.PageSize * NandTest_Geo.PagesPerBlock;
+    uint32  D0 = BB - NandTest_Geo.PageSize;
+    uint32  i;
+
+    V_NewVolume();
+    M_Files[0] = M_Make("/boot/kernel.elf", 2 * BB + 1234, 501, EEFS_FILE_TYPE_BOOT_ELF, 1);
+    M_Files[1] = M_Make("/cf/apps/x.so", BB + 77, 502, EEFS_FILE_TYPE_CFS_APP, 1);
+    M_Files[2] = M_Make("/etc/cfg", 100, 503, EEFS_FILE_TYPE_OTHER, 1);
+    M_Files[3] = M_Make("/empty", 0, 504, EEFS_FILE_TYPE_OTHER, 1);
+    M_Files[4] = M_Make("/boot/board.dtb", 3000, 505, EEFS_FILE_TYPE_BOOT_DTB, 1);
+    M_Count = 5;
+    for (i = 0; i < M_Count; i++) {
+        CHECK_RC(M_Write(&M_Files[i]), EEFS_SUCCESS);
+    }
+    CHECK_RC(EEFS_LibCommit(&V_Vol), EEFS_SUCCESS);
+    M_CheckAll();
+
+    /* a copy-on-write modify, a rename, a remove and an attribute change in one batch */
+    M_Files[0].F.Mod[M_Files[0].F.ModCount++] = D0 + 5;        /* position 1 changes, position 2 is kept */
+    M_Files[0].Version = 2;
+    CHECK_RC(M_Write(&M_Files[0]), EEFS_SUCCESS);
+    CHECK_RC(EEFS_LibRename(&V_Vol, "/cf/apps/x.so", "/cf/apps/y.so"), EEFS_SUCCESS);
+    M_Files[1].Live = 0;
+    M_Files[5] = M_Files[1];
+    M_Files[5].F.Path = "/cf/apps/y.so";
+    M_Files[5].Live = 1;
+    CHECK_RC(EEFS_LibRemove(&V_Vol, "/etc/cfg"), EEFS_SUCCESS);
+    M_Files[2].Live = 0;
+    CHECK_RC(EEFS_LibSetFileAttributes(&V_Vol, "/boot/board.dtb", EEFS_ATTRIBUTE_READONLY), EEFS_SUCCESS);
+    M_Files[4].F.Attributes = EEFS_ATTRIBUTE_READONLY;
+    M_Count = 6;
+    CHECK_RC(EEFS_LibCommit(&V_Vol), EEFS_SUCCESS);
+    M_CheckAll();
+
+    /* an uncommitted rewrite is invisible to the loader until the commit */
+    M_Files[0].F.Mod[M_Files[0].F.ModCount++] = 3;
+    M_Files[0].Version = 3;
+    CHECK_RC(M_Write(&M_Files[0]), EEFS_SUCCESS);
+    T_PrepBuffers();
+    {
+        MicroEEFS_NandInfo_t    Info;
+        V_File_t                Old = M_Files[0].F;
+
+        Old.ModCount--;
+        CHECK_RC(MicroEEFS_NandLoadFile(&V_Dev, PageBuf, "/boot/kernel.elf", Dest, T_DEST_SIZE, &Info), EEFS_SUCCESS);
+        CHECK_EQ(Info.Info.Version, 2);
+        CHECK(memcmp(Dest, V_Content(&Old), Old.Size) == 0);
+    }
+    CHECK_RC(EEFS_LibCommit(&V_Vol), EEFS_SUCCESS);
+    M_CheckAll();
+
+    /* grow and shrink, re-add a removed name at another index, and enough commits to enter new ring blocks */
+    M_Files[5].F.Size = 3 * BB;
+    CHECK_RC(M_Write(&M_Files[5]), EEFS_SUCCESS);
+    M_Files[0].F.Size = D0 - 10;
+    CHECK_RC(M_Write(&M_Files[0]), EEFS_SUCCESS);
+    M_Files[2].Live = 1;
+    M_Files[2].F.Seed = 506;
+    CHECK_RC(M_Write(&M_Files[2]), EEFS_SUCCESS);
+    CHECK_RC(EEFS_LibCommit(&V_Vol), EEFS_SUCCESS);
+    M_CheckAll();
+    for (i = 0; i < 2 * NandTest_Geo.PagesPerBlock; i++) {
+        M_Files[2].F.Seed = 600 + i;
+        M_Files[2].F.Size = 50 + i;
+        CHECK_RC(M_Write(&M_Files[2]), EEFS_SUCCESS);
+        CHECK_RC(EEFS_LibCommit(&V_Vol), EEFS_SUCCESS);
+    }
+    M_CheckAll();
+
+    /* and after a remount of the library */
+    CHECK_RC(V_Mount(&V_Vol), EEFS_SUCCESS);
+    M_CheckAll();
+    V_Destroy();
+}
+
 /* Argument and geometry validation */
 static void micro_invalid_arguments(void)
 {
@@ -1305,6 +1496,7 @@ const NandTest_Case_t NandTest_MicroCases[] = {
     { "micro_geometry_mismatch",                                    micro_geometry_mismatch },
     { "micro_bad_directory_blocks",                                 micro_bad_directory_blocks },
     { "micro_invalid_arguments",                                    micro_invalid_arguments },
+    { "micro_matches_library_state",                                micro_matches_library_state },
     { NULL,                                                         NULL }
 };
 

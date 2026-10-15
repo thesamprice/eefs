@@ -91,6 +91,8 @@ extern EEFS_NandGeometry_t  NandTest_Geo;
 extern const NandTest_Case_t NandTest_LayoutCases[];
 extern const NandTest_Case_t NandTest_SimCases[];
 extern const NandTest_Case_t NandTest_JournalCases[];
+extern const NandTest_Case_t NandTest_FileopsCases[];
+extern const NandTest_Case_t NandTest_PowercutCases[];
 
 /*
  * Exported Functions

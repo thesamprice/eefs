@@ -490,6 +490,13 @@ Used only when neither mirror has a valid checkpoint.
    else B; `FallbackCompatible` = 0; `ActiveFailed` = 0; `Attributes`, `FileType`,
    `CreationDate` from the active slot's page. All other blocks are free.
 
+Writers program a file's data blocks before its first block, but within the first block page 0
+necessarily comes before the block's own data pages. An interrupted write can therefore leave a valid
+metadata page whose first block holds incomplete data (every other listed block is complete). A
+rebuilder should check `Blocks[0].Crc32` against the first block's data before accepting a candidate
+in step 1 and treat a candidate that fails it as an orphan (the library's rebuild does; a reader that
+skips the check may pick such a copy and then fail its CRC check when loading it).
+
 A rebuild recovers every completely written file. It cannot distinguish committed from
 uncommitted: it may include files from a batch that was never committed, and a removed or
 superseded copy whose cleanup erase was interrupted. The library mounts the rebuilt state in RAM

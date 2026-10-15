@@ -167,6 +167,12 @@ int32 EEFS_UnMount(char *MountPoint)
                     if ((EEFS_LibHasOpenFiles(&Device->InodeTable) == FALSE) &&
                         (EEFS_LibHasOpenDir(&Device->InodeTable) == FALSE)) {
 
+#ifdef EEFS_BACKEND_NAND
+                        /* unmount commits the pending batch (call EEFS_Abort first to drop it) */
+                        if (EEFS_LibCommit(&Device->InodeTable) != EEFS_SUCCESS) {
+                            return(EEFS_ERROR);
+                        }
+#endif
                         ReturnCode = EEFS_FreeVolume(Volume);
                     }
                     else { /* can't unmount a volume while files are open */

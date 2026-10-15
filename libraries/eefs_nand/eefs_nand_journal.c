@@ -279,7 +279,13 @@ int32 EEFS_NandMount(EEFS_InodeTable_t *Vol)
 
     /* step 7 */
     memcpy(&Vol->Base, &Vol->Working, sizeof(Vol->Base));
-    Vol->AllocCursor = Geo->DirRegionBlocks;    /* seeded from the owned blocks by the phase 3 allocator */
+    Vol->AllocCursor = Geo->DirRegionBlocks;    /* round-robin cursor (6.9): after the highest owned block */
+    for (b = Geo->BlockCount; b > Geo->DirRegionBlocks; b--) {
+        if (EEFS_NAND_MAP_IS_OWNER(Vol->Working.Map[b - 1])) {
+            Vol->AllocCursor = (b < Geo->BlockCount) ? b : Geo->DirRegionBlocks;
+            break;
+        }
+    }
 
     /* step 8 */
     High = Vol->Working.WriteSeqHigh;
@@ -713,6 +719,21 @@ int32 EEFS_NandAbort(EEFS_InodeTable_t *Vol)
                 if (EEFS_NandEraseBlock(Vol, First) != EEFS_SUCCESS) {
                     EEFS_NandMarkBad(Vol, First);
                 }
+            }
+        }
+    }
+
+    /* likewise the first blocks the batch created and then superseded itself (written, then rewritten, renamed or
+     * removed in the same batch): they are on the batch's cleanup list and free in the committed map */
+    for (i = Vol->PendingCleanupBase; i < Vol->PendingCleanupCount; i++) {
+        First = Vol->PendingCleanup[i];
+        if ((First < Geo->DirRegionBlocks) || (First >= Geo->BlockCount) ||
+            (Vol->Base.Map[First] != EEFS_NAND_MAP_FREE) || (Vol->Working.Map[First] != EEFS_NAND_MAP_FREEING)) {
+            continue;
+        }
+        if (EEFS_NandPageIsErased(Vol, First, 0) == FALSE) {
+            if (EEFS_NandEraseBlock(Vol, First) != EEFS_SUCCESS) {
+                EEFS_NandMarkBad(Vol, First);
             }
         }
     }

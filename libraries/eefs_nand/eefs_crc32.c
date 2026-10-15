@@ -111,6 +111,24 @@ uint32 EEFS_Crc32Update(uint32 State, const void *Data, uint32 Length)
 
 } /* End of EEFS_Crc32Update() */
 
+/* Feeds the same Length bytes into two running CRCs (a block CRC and a whole-file CRC).  The two chains are
+ * independent, so the CPU overlaps them and this costs about one EEFS_Crc32Update, not two. */
+void EEFS_Crc32Update2(uint32 *StateA, uint32 *StateB, const void *Data, uint32 Length)
+{
+    const uint8    *Bytes = (const uint8 *)Data;
+    uint32          A = *StateA;
+    uint32          B = *StateB;
+    uint32          i;
+
+    for (i = 0; i < Length; i++) {
+        A = EEFS_Crc32Table[(A ^ Bytes[i]) & 0xFF] ^ (A >> 8);
+        B = EEFS_Crc32Table[(B ^ Bytes[i]) & 0xFF] ^ (B >> 8);
+    }
+    *StateA = A;
+    *StateB = B;
+
+} /* End of EEFS_Crc32Update2() */
+
 /* Returns the CRC of the bytes fed so far */
 uint32 EEFS_Crc32Final(uint32 State)
 {

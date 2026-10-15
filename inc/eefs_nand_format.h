@@ -286,6 +286,7 @@ typedef struct
  * Final.  EEFS_Crc32("123456789") = 0xCBF43926; the CRC of zero bytes is 0. */
 uint32  EEFS_Crc32Update(uint32 State, const void *Data, uint32 Length);
 uint32  EEFS_Crc32Final(uint32 State);
+void    EEFS_Crc32Update2(uint32 *StateA, uint32 *StateB, const void *Data, uint32 Length);   /* both states, one pass */
 uint32  EEFS_Crc32(const void *Data, uint32 Length);
 
 /* Little-endian field access */

@@ -50,6 +50,8 @@ static const NandTest_Suite_t NandTest_Suites[] = {
     { "sim",    NandTest_SimCases },
     { "journal", NandTest_JournalCases },
     { "micro",  NandTest_MicroCases },
+    { "fileops", NandTest_FileopsCases },
+    { "powercut", NandTest_PowercutCases },
     { NULL,     NULL }
 };
 
