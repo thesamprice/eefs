@@ -62,12 +62,13 @@
 #define EEFS_HEALTH_AB_FALLBACK_UNAVAILABLE     25  /* informational */
 #define EEFS_HEALTH_AB_FAILED_FLAG_SET          26
 #define EEFS_HEALTH_AB_LOAD_MIXED               27  /* one finding; Path = first entry whose ActiveSlot differs from entry 0's (informational) */
-#define EEFS_HEALTH_DIR_PAGE0_MISMATCH          30  /* Path, Slot, Block: page 0 Path differs, or explicit Slot differs, or BlockCount != AllocBlocks */
-#define EEFS_HEALTH_DIR_PAGE0_STALE             31  /* Path, Slot, Block: Version/WriteSeq/FileSize/FileCrc32 differ (informational) */
+#define EEFS_HEALTH_DIR_PAGE0_MISMATCH          30  /* Path, Slot, Block, Aux0 = reason (1 Path, 2 Slot, 3 BlockCount, 4 copied fields): page 0 disagrees with the directory entry */
+/* 31 was DIR_PAGE0_STALE (removed with in-place modify; copied fields can no longer be legitimately stale).  Do not reuse. */
 #define EEFS_HEALTH_MAP_MISMATCH                32  /* Block, Aux0 = map value, Aux1 = OWNER expected or 0xFFFF */
 #define EEFS_HEALTH_BLOCK_CROSSLINKED           33  /* Path, Slot (second claimant), Block, Aux0 = OWNER of the first claimant */
 #define EEFS_HEALTH_BADBLOCK_UNRECORDED         34  /* Block */
 #define EEFS_HEALTH_ORPHAN_FILE                 35  /* Path (from page 0), Slot (page 0 Slot), Block, Aux0 = WriteSeq */
+#define EEFS_HEALTH_FREE_BELOW_RESERVE          40  /* Aux0 = free blocks, Aux1 = EEFS_NAND_RESERVE_BLOCKS; informational unless free < EEFS_NAND_BADBLOCK_RESERVE */
 
 /* Health summary bits */
 #define EEFS_HEALTH_OK                          0x00
@@ -75,9 +76,10 @@
 #define EEFS_HEALTH_AB_ISSUE                    0x02    /* codes 20-23, 26 */
 #define EEFS_HEALTH_DIR_ISSUE                   0x04    /* codes 1-6, 30, 32-35 */
 #define EEFS_HEALTH_FILE_ISSUE                  0x08    /* codes 10-12 */
-#define EEFS_HEALTH_INFO                        0x10    /* codes 24, 25, 27, 31 */
+#define EEFS_HEALTH_INFO                        0x10    /* codes 24, 25, 27, and 40 while free >= EEFS_NAND_BADBLOCK_RESERVE */
 #define EEFS_HEALTH_OVERFLOW                    0x20    /* findings dropped */
 #define EEFS_HEALTH_INCOMPLETE                  0x40    /* not finished (only in a snapshot taken before DONE) */
+#define EEFS_HEALTH_SPACE_ISSUE                 0x80    /* code 40 present (with DEGRADED when free < EEFS_NAND_BADBLOCK_RESERVE) */
 
 /*
  * Type Definitions
@@ -145,9 +147,10 @@ typedef struct
 {
     EEFS_NandDevice_t                  *Dev;                /* from BaseAddress */
     uint32                              Mounted;
-    EEFS_NandDirState_t                 Base;               /* committed state as on media (plus in-place refreshes) */
+    EEFS_NandDirState_t                 Base;               /* committed state as on media (plus detected media facts, section 4) */
     EEFS_NandDirState_t                 Working;            /* pending state */
     uint8                               ForceDirty[(EEFS_MAX_FILES + 7) / 8];  /* entries to include in the next record regardless of diff */
+    uint32                              AllocCursor;        /* round-robin allocation cursor, RAM only (6.9) */
     uint8                               SlotFlags[EEFS_MAX_FILES][2];          /* EEFS_NAND_SLOTFLAG_* */
     uint32                              NextWriteSeq;
     uint32                              LastSeq;            /* newest committed record Seq */

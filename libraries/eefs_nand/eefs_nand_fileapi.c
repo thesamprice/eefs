@@ -14,11 +14,12 @@
  * Purpose: EEFS_Lib* API of the NAND backend: mount, file operations, A/B, descriptors, directory listing and stat.
  *
  * Design Notes:
- *   Phase 1 of docs/nand-implementation.md: the API exists so that drivers and applications build against it.
- *   Every volume function validates its pointer arguments (EEFS_INVALID_ARGUMENT) and otherwise returns
- *   EEFS_UNSUPPORTED_OPTION (NULL for the directory functions) until the phase that implements it lands.  The global
- *   descriptor table and the helpers that only inspect it (EEFS_LibInit, EEFS_LibHasOpenFiles, ...) behave as in the
- *   EEPROM backend already; nothing can open a descriptor yet.  EEFS_LibCreat and EEFS_LibWrite are final: the NAND
+ *   Phase 2 of docs/nand-implementation.md: format, mount, unmount, commit, abort and RepairDirectory are real (the
+ *   directory algorithms live in eefs_nand_journal.c), as are the map and cleanup-list helpers that later phases use
+ *   to free slots.  The file operations still validate their pointer arguments (EEFS_INVALID_ARGUMENT) and return
+ *   EEFS_UNSUPPORTED_OPTION (NULL for the directory functions) until the phase that implements them lands.  The
+ *   global descriptor table and the helpers that only inspect it (EEFS_LibInit, EEFS_LibHasOpenFiles, ...) behave as
+ *   in the EEPROM backend; nothing can open a descriptor yet.  EEFS_LibCreat and EEFS_LibWrite are final: the NAND
  *   backend writes whole files with EEFS_LibWriteFile.
  *
  */
@@ -68,23 +69,60 @@ void EEFS_LibInit(void)
 
 } /* End of EEFS_LibInit() */
 
-/* Mounts the volume (section 5.2).  Not implemented yet (phase 2). */
+/* Mounts the volume behind BaseAddress (an EEFS_NandDevice_t *), section 5.2.  Reads only. */
 int32 EEFS_LibInitFS(EEFS_InodeTable_t *InodeTable, cpuaddr BaseAddress)
 {
+    int32   ReturnCode;
+
     if ((InodeTable == NULL) || (BaseAddress == 0)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if (InodeTable->Mounted != 0) {
+        ReturnCode = EEFS_INVALID_ARGUMENT;
+    }
+    else {
+        memset(InodeTable, 0, sizeof(EEFS_InodeTable_t));
+        InodeTable->Dev = (EEFS_NandDevice_t *)BaseAddress;
+        if ((ReturnCode = EEFS_NandCheckGeometry(InodeTable)) == EEFS_SUCCESS) {
+            ReturnCode = EEFS_NandMount(InodeTable);
+        }
+        if (ReturnCode != EEFS_SUCCESS) {
+            memset(InodeTable, 0, sizeof(EEFS_InodeTable_t));
+        }
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibInitFS() */
 
-/* Unmounts the volume.  Not implemented yet (phase 2). */
+/* Unmounts the volume.  The batch must have been committed or aborted. */
 int32 EEFS_LibFreeFS(EEFS_InodeTable_t *InodeTable)
 {
+    int32   ReturnCode;
+
     if (InodeTable == NULL) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if (InodeTable->Mounted == 0) {
+        ReturnCode = EEFS_INVALID_ARGUMENT;
+    }
+    else if ((EEFS_LibHasOpenFiles(InodeTable) == TRUE) || (EEFS_LibHasOpenDir(InodeTable) == TRUE) ||
+             (InodeTable->ActiveReport != NULL)) {
+        ReturnCode = EEFS_DEVICE_IS_BUSY;
+    }
+    else if (EEFS_NandHasUncommitted(InodeTable, FALSE) == TRUE) {
+        ReturnCode = EEFS_TRANSACTION_ERROR;
+    }
+    else {
+        memset(InodeTable, 0, sizeof(EEFS_InodeTable_t));
+        ReturnCode = EEFS_SUCCESS;
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibFreeFS() */
 
@@ -333,13 +371,29 @@ void EEFS_LibPrintOpenFiles(void)
  * NAND API (eefs_nand.h)
  */
 
-/* Formats the device (section 5.1).  Not implemented yet (phase 2). */
+/* Formats the device (section 5.1).  Scratch is working RAM and is left zeroed (unmounted). */
 int32 EEFS_LibFormat(EEFS_InodeTable_t *Scratch, cpuaddr BaseAddress)
 {
+    int32   ReturnCode;
+
     if ((Scratch == NULL) || (BaseAddress == 0)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if (Scratch->Mounted != 0) {
+        ReturnCode = EEFS_DEVICE_IS_BUSY;
+    }
+    else {
+        memset(Scratch, 0, sizeof(EEFS_InodeTable_t));
+        Scratch->Dev = (EEFS_NandDevice_t *)BaseAddress;
+        if ((ReturnCode = EEFS_NandCheckGeometry(Scratch)) == EEFS_SUCCESS) {
+            ReturnCode = EEFS_NandFormat(Scratch);
+        }
+        memset(Scratch, 0, sizeof(EEFS_InodeTable_t));
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibFormat() */
 
@@ -354,23 +408,33 @@ int32 EEFS_LibWriteFile(EEFS_InodeTable_t *InodeTable, char *Name, const EEFS_Na
 
 } /* End of EEFS_LibWriteFile() */
 
-/* Commits the batch (section 5.4).  Not implemented yet (phase 2). */
+/* Commits the batch (section 5.4) */
 int32 EEFS_LibCommit(EEFS_InodeTable_t *InodeTable)
 {
-    if (InodeTable == NULL) {
+    int32   ReturnCode;
+
+    if ((InodeTable == NULL) || (InodeTable->Mounted == 0)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+    EEFS_LIB_LOCK;
+    ReturnCode = EEFS_NandCommit(InodeTable, FALSE);
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibCommit() */
 
-/* Discards the batch (section 5.5).  Not implemented yet (phase 2). */
+/* Discards the batch (section 5.5) */
 int32 EEFS_LibAbort(EEFS_InodeTable_t *InodeTable)
 {
-    if (InodeTable == NULL) {
+    int32   ReturnCode;
+
+    if ((InodeTable == NULL) || (InodeTable->Mounted == 0)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+    EEFS_LIB_LOCK;
+    ReturnCode = EEFS_NandAbort(InodeTable);
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibAbort() */
 
@@ -393,6 +457,16 @@ int32 EEFS_LibGetFileInfo(EEFS_InodeTable_t *InodeTable, char *Name, EEFS_NandFi
     return(EEFS_UNSUPPORTED_OPTION);
 
 } /* End of EEFS_LibGetFileInfo() */
+
+/* Space and state of the volume (section 6.9).  Not implemented yet (phase 3, with the allocator). */
+int32 EEFS_LibGetVolumeInfo(EEFS_InodeTable_t *InodeTable, EEFS_NandVolumeInfo_t *Info)
+{
+    if ((InodeTable == NULL) || (Info == NULL)) {
+        return(EEFS_INVALID_ARGUMENT);
+    }
+    return(EEFS_UNSUPPORTED_OPTION);
+
+} /* End of EEFS_LibGetVolumeInfo() */
 
 /* A/B setters (section 7.2).  Not implemented yet (phase 5). */
 int32 EEFS_LibSetActiveSlot(EEFS_InodeTable_t *InodeTable, char *Name, uint8 Slot)
@@ -482,15 +556,86 @@ int32 EEFS_LibCopySlotAll(EEFS_InodeTable_t *InodeTable, uint8 From, uint8 To)
 
 } /* End of EEFS_LibCopySlotAll() */
 
-/* Commits and writes a fresh checkpoint to both mirrors (section 8.2).  Not implemented yet (phase 2). */
+/* Commits pending changes and writes a fresh CHECKPOINT into a new block of both mirrors (section 8.2) */
 int32 EEFS_LibRepairDirectory(EEFS_InodeTable_t *InodeTable)
 {
-    if (InodeTable == NULL) {
+    int32   ReturnCode;
+
+    if ((InodeTable == NULL) || (InodeTable->Mounted == 0)) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+    EEFS_LIB_LOCK;
+    if (InodeTable->PendingCleanupBase > 0) {
+        EEFS_NandRunPendingCleanup(InodeTable);
+    }
+    ReturnCode = EEFS_NandCommit(InodeTable, TRUE);
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibRepairDirectory() */
+
+/*
+ * Map and cleanup-list helpers (eefs_nand_internal.h, section 3.3)
+ */
+
+/* Back to FREE; a BAD block stays BAD */
+void EEFS_NandReleaseBlocks(EEFS_InodeTable_t *Vol, const uint16 *Blocks, uint32 Count)
+{
+    uint32  i;
+
+    for (i = 0; i < Count; i++) {
+        if ((Blocks[i] < Vol->Dev->Geometry.BlockCount) && (Vol->Working.Map[Blocks[i]] != EEFS_NAND_MAP_BAD)) {
+            Vol->Working.Map[Blocks[i]] = EEFS_NAND_MAP_FREE;
+        }
+    }
+
+} /* End of EEFS_NandReleaseBlocks() */
+
+/* Frees a whole slot in the batch: its blocks become FREEING, its first block goes on the cleanup list */
+void EEFS_NandFreeSlot(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot)
+{
+    EEFS_NandSlot_t    *S = &Vol->Working.Entry[Entry].Slot[Slot];
+    uint8               Owner = EEFS_NAND_MAP_OWNER(Entry, Slot);
+    uint32              b;
+
+    for (b = Vol->Dev->Geometry.DirRegionBlocks; b < Vol->Dev->Geometry.BlockCount; b++) {
+        if (Vol->Working.Map[b] == Owner) {
+            Vol->Working.Map[b] = EEFS_NAND_MAP_FREEING;
+        }
+    }
+    if (S->InUse != 0) {
+        (void)EEFS_NandAddCleanup(Vol, S->FirstBlock);
+    }
+    memset(S, 0, sizeof(EEFS_NandSlot_t));
+
+} /* End of EEFS_NandFreeSlot() */
+
+/* Copy-on-write: every block of the slot except Keep[] becomes FREEING */
+void EEFS_NandFreeBlocksExcept(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot, const uint16 *Keep, uint32 KeepCount)
+{
+    uint8   Owner = EEFS_NAND_MAP_OWNER(Entry, Slot);
+    uint32  b;
+    uint32  k;
+
+    for (b = Vol->Dev->Geometry.DirRegionBlocks; b < Vol->Dev->Geometry.BlockCount; b++) {
+        if (Vol->Working.Map[b] == Owner) {
+            Vol->Working.Map[b] = EEFS_NAND_MAP_FREEING;
+        }
+    }
+    for (k = 0; k < KeepCount; k++) {
+        if ((Keep[k] < Vol->Dev->Geometry.BlockCount) && (Vol->Working.Map[Keep[k]] == EEFS_NAND_MAP_FREEING)) {
+            Vol->Working.Map[Keep[k]] = Owner;
+        }
+    }
+
+} /* End of EEFS_NandFreeBlocksExcept() */
+
+/* Records a change of the volume (restarts a running health check) */
+void EEFS_NandTouch(EEFS_InodeTable_t *Vol)
+{
+    Vol->VolumeChangeCounter++;
+
+} /* End of EEFS_NandTouch() */
 
 /*
  * Local Functions

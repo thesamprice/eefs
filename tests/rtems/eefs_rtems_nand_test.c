@@ -1,9 +1,10 @@
 /*
  * RTEMS smoke test for the EEFS NAND backend (EEFS_BACKEND=nand).
  *
- * Phase 1 placeholder (docs/nand-implementation.md section 14): the file system calls are stubs, so this only
- * checks, on the target, the pieces that exist: the CRC-32, the RAM NAND simulator, and a metadata page
- * encode/decode round trip through the simulator.  Phase 8 replaces it with the full test.
+ * Phase 2 (docs/nand-implementation.md section 14): checks, on the target, the CRC-32, the RAM NAND simulator, a
+ * metadata page encode/decode round trip through the simulator, and the journaled directory: format and mount
+ * through the standalone driver, then commit, unmount and remount through the library with a directory change that
+ * must survive.  Phase 8 replaces it with the full test.
  * Prints "EEFS RTEMS TEST PASSED" or "EEFS RTEMS TEST FAILED" and exits.
  */
 
@@ -20,8 +21,9 @@
 #include "microeefs_nand.h"
 #include "nand_sim.h"
 
-static int   Failures;
-static uint8 Page[4096];
+static int               Failures;
+static uint8             Page[4096];
+static EEFS_InodeTable_t Vol;           /* about 62 KB: static, not on the task stack */
 
 #define CHECK(cond)                                                     \
     do {                                                                \
@@ -75,8 +77,33 @@ static void check_nand_format(void)
     CHECK(strcmp(D.Type.App.AppName, "SAMPLE_APP") == 0);
     CHECK(D.Type.App.LoadAddress == 0x100000);
 
-    /* the file system itself is not implemented yet (phase 2 onwards) */
-    CHECK(EEFS_Format("/NANDDEV0", (cpuaddr)&Dev) == EEFS_UNSUPPORTED_OPTION);
+    /* format and mount through the standalone driver */
+    CHECK(EEFS_Format("/NANDDEV0", (cpuaddr)&Dev) == EEFS_SUCCESS);
+    CHECK(EEFS_Mount("/NANDDEV0", "/NAND0") == EEFS_SUCCESS);
+    CHECK(EEFS_Commit("/NAND0") == EEFS_SUCCESS);          /* nothing to commit */
+    CHECK(EEFS_Abort("/NAND0") == EEFS_SUCCESS);
+    CHECK(EEFS_RepairDirectory("/NAND0") == EEFS_SUCCESS); /* fresh checkpoint in both mirrors */
+    CHECK(EEFS_UnMount("/NAND0") == EEFS_SUCCESS);
+
+    /* a directory change committed through the library survives an unmount and a remount */
+    memset(&Vol, 0, sizeof(Vol));
+    CHECK(EEFS_LibInitFS(&Vol, (cpuaddr)&Dev) == EEFS_SUCCESS);
+    CHECK(Vol.LastSeq == 2);
+    strcpy(Vol.Working.Entry[3].Path, "/cf/apps/sample_app.so");
+    Vol.Working.Entry[3].InUse = 1;
+    Vol.Working.Entry[3].FileType = EEFS_FILE_TYPE_CFS_APP;
+    Vol.Working.Entry[3].Attributes = EEFS_ATTRIBUTE_READONLY;
+    CHECK(EEFS_LibFreeFS(&Vol) == EEFS_TRANSACTION_ERROR);  /* uncommitted batch */
+    CHECK(EEFS_LibCommit(&Vol) == EEFS_SUCCESS);
+    CHECK(Vol.LastSeq == 3);
+    CHECK(EEFS_LibFreeFS(&Vol) == EEFS_SUCCESS);
+    CHECK(EEFS_LibInitFS(&Vol, (cpuaddr)&Dev) == EEFS_SUCCESS);
+    CHECK(Vol.LastSeq == 3);
+    CHECK(Vol.Working.Entry[3].InUse == 1);
+    CHECK(strcmp(Vol.Working.Entry[3].Path, "/cf/apps/sample_app.so") == 0);
+    CHECK(Vol.Working.Entry[3].Attributes == EEFS_ATTRIBUTE_READONLY);
+    CHECK(Vol.Mirror[0].LastSeq == 3 && Vol.Mirror[1].LastSeq == 3);
+    CHECK(EEFS_LibFreeFS(&Vol) == EEFS_SUCCESS);
 
     NandSim_Destroy(Sim);
 }

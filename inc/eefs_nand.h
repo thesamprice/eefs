@@ -70,6 +70,27 @@ int32   EEFS_LibVerifyFile(EEFS_InodeTable_t *InodeTable, char *Name);
  * EEFS_CORRUPT_FILE (Info is still filled from the directory, Type zeroed), EEFS_IO_ERROR. */
 int32   EEFS_LibGetFileInfo(EEFS_InodeTable_t *InodeTable, char *Name, EEFS_NandFileInfo_t *Info);
 
+/* Space and state of the volume (docs/nand-implementation.md 6.9).  No NAND reads.  EEFS_SUCCESS. */
+typedef struct
+{
+    uint32  BlockCount, DirRegionBlocks, DataBlocks;    /* DataBlocks = BlockCount - DirRegionBlocks */
+    uint32  FreeBlocks;             /* map == FREE, including blocks awaiting a pending cleanup erase */
+    uint32  FreeingBlocks;          /* freed in the open batch; free after the next commit */
+    uint32  UsedBlocks;             /* owned by a slot in Working (committed or pending) */
+    uint32  BadBlocks;              /* map == BAD, both regions */
+    uint32  ReserveBlocks;          /* EEFS_NAND_RESERVE_BLOCKS */
+    uint32  BadBlockReserve;        /* EEFS_NAND_BADBLOCK_RESERVE */
+    uint32  AvailableForNew;        /* FreeBlocks > ReserveBlocks ? FreeBlocks - ReserveBlocks : 0 */
+    uint32  AvailableForModify;     /* FreeBlocks > BadBlockReserve ? FreeBlocks - BadBlockReserve : 0 */
+    uint32  FilesInUse, SlotsInUse;
+    uint32  LastSeq, NextWriteSeq;
+    uint32  PendingCleanup;         /* entries on the list (from media and from the batch) */
+    uint8   DirectoryRebuilt;
+    uint8   UncommittedChanges;     /* Working != Base, or ForceDirty set */
+    uint8   MirrorValid[2];         /* Mirror[m].HasState && !Disabled */
+} EEFS_NandVolumeInfo_t;
+int32   EEFS_LibGetVolumeInfo(EEFS_InodeTable_t *InodeTable, EEFS_NandVolumeInfo_t *Info);
+
 /* A/B.  Name must not carry a suffix for these. */
 int32   EEFS_LibSetActiveSlot(EEFS_InodeTable_t *InodeTable, char *Name, uint8 Slot);
 int32   EEFS_LibSetActiveSlotAll(EEFS_InodeTable_t *InodeTable, uint8 Slot);             /* >= 0: entries changed */

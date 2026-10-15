@@ -766,6 +766,16 @@ int32 EEFS_Abort(char *MountPoint)
     return(EEFS_LibAbort(&Device->InodeTable));
 }
 
+/* Space and state of a volume */
+int32 EEFS_GetVolumeInfo(char *MountPoint, EEFS_NandVolumeInfo_t *Info)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibGetVolumeInfo(&Device->InodeTable, Info));
+}
+
 /* Checks every CRC of a file */
 int32 EEFS_VerifyFile(char *Path)
 {

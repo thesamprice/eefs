@@ -90,6 +90,7 @@ extern EEFS_NandGeometry_t  NandTest_Geo;
 /* Case tables of the suites */
 extern const NandTest_Case_t NandTest_LayoutCases[];
 extern const NandTest_Case_t NandTest_SimCases[];
+extern const NandTest_Case_t NandTest_JournalCases[];
 
 /*
  * Exported Functions

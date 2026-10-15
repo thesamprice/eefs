@@ -10,10 +10,11 @@
 set(EEFS_NAND_TEST_SOURCES
     nand_test_main.c
     test_layout.c
-    test_sim.c)
+    test_sim.c
+    test_journal.c)
 
-# Suites registered so far (later phases append journal fileops powercut rebuild ab health micro)
-set(EEFS_NAND_SUITES layout sim)
+# Suites registered so far (later phases append fileops powercut rebuild ab health micro)
+set(EEFS_NAND_SUITES layout sim journal)
 
 # PageSize:OobSize:PagesPerBlock
 set(EEFS_NAND_GEOMETRIES 4096:224:128 2048:64:64 8192:448:64)

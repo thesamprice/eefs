@@ -74,9 +74,13 @@
 #define EEFS_NAND_MAX_CLEANUP_BLOCKS        256
 #endif
 
-/* Extra blocks allocated to new and relocated files */
-#ifndef EEFS_NAND_CREAT_SPARE_BLOCKS
-#define EEFS_NAND_CREAT_SPARE_BLOCKS        0
+/* Reserved spare pool (docs/nand-implementation.md 6.9): free blocks held back from new-file and CopySlot
+ * allocations, and the smaller part of them held back from everything but the replacement of a grown bad block */
+#ifndef EEFS_NAND_RESERVE_BLOCKS
+#define EEFS_NAND_RESERVE_BLOCKS            16
+#endif
+#ifndef EEFS_NAND_BADBLOCK_RESERVE
+#define EEFS_NAND_BADBLOCK_RESERVE          4
 #endif
 
 /* Read back every programmed page */
@@ -84,9 +88,9 @@
 #define EEFS_NAND_VERIFY_WRITES             1
 #endif
 
-/* Open checks every block CRC, not just the metadata page */
+/* 1: Open also checks every block CRC and the file CRC.  Default 0: Open checks the metadata page only */
 #ifndef EEFS_NAND_VERIFY_ON_OPEN
-#define EEFS_NAND_VERIFY_ON_OPEN            1
+#define EEFS_NAND_VERIFY_ON_OPEN            0
 #endif
 
 /* Commit after every mutating call */
@@ -114,6 +118,9 @@
 
 #if defined(EEFS_BACKEND_NAND) && (EEFS_MAX_FILES > 126)
 #error "EEFS_MAX_FILES must be <= 126 for the NAND block map encoding"
+#endif
+#if defined(EEFS_BACKEND_NAND) && (EEFS_NAND_BADBLOCK_RESERVE > EEFS_NAND_RESERVE_BLOCKS)
+#error "EEFS_NAND_BADBLOCK_RESERVE must be <= EEFS_NAND_RESERVE_BLOCKS"
 #endif
 
 #endif 

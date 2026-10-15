@@ -736,13 +736,17 @@ void    EEFS_NandMarkBad(Vol, uint32 Block);             /* Working.Map[Block] =
 boolean EEFS_NandHasBadMarker(Vol, uint32 Block);        /* reads the OOB of every BadMarkerPages page (Data NULL); TRUE if any byte at BadMarkerOffset != 0xFF or a read fails */
 int32   EEFS_NandReadPage0(Vol, uint32 Block, EEFS_NandPage0_t *P, const uint8 **Raw);
         /* cached read + EEFS_NandDecodePage0(PagesPerBlock from the geometry, ExpectBlock = Block) + bounds check of every Blocks[i] (>= DirRegionBlocks, < BlockCount). SUCCESS / EEFS_CORRUPT_FILE / EEFS_IO_ERROR. *Raw = cache pointer for Blocks[] access. */
+boolean EEFS_NandPageIsErased(Vol, uint32 Block, uint32 Page);   /* uncached data read into PageBuf; a read error counts as not erased */
 ```
 
 `EEFS_NandProgramPage` uses `Vol->PageBuf` as the read-back scratch; callers that are building the
 page *in* `PageBuf` (record pages, page 0) must use `EEFS_NandProgramPageVerified` with
-`Vol->CacheBuf` as scratch (the cache is invalidated anyway). For dir record pages the read-back
-check is "decode header + CRC OK and Seq/PageIndex match" rather than a byte compare, so no second
-buffer is needed; `EEFS_NandWriteRecordPage` (3.2) does this.
+`Vol->CacheBuf` as scratch (the cache is invalidated anyway). As delivered, a scratch equal to the
+source is replaced by the other buffer, and directory record pages are verified the same way (a byte
+compare of the read-back in `CacheBuf`, done by `EEFS_NandWriteRecord`), which is stricter than a
+header decode and needs no extra buffer. `EEFS_NandMarkBad` removes a directory block from its ring by
+shifting the ring down; if the removed block was the current one, `CurIndex` moves to its predecessor
+(so the next `EnterBlock` lands on the block that followed it) and `EnterNewBlock` is set.
 
 ### 3.2 Journal (`eefs_nand_journal.c`, phase 2)
 
@@ -772,6 +776,15 @@ int32   EEFS_NandAddCleanup(Vol, uint16 Block);              /* append to Pendin
 boolean EEFS_NandCleanupHasRoom(Vol, uint32 Needed);
 void    EEFS_NandForgetCleanup(Vol, uint16 Block);           /* remove Block if present (called by the allocator) */
 void    EEFS_NandDiff(Vol, uint8 *EntryMask, uint32 *MapRanges);   /* computes the dirty entry mask (memcmp + ForceDirty) and counts changed map bytes */
+
+/* Added in phase 2 (journal.c), so that EEFS_LibFormat / EEFS_LibInitFS stay thin and phase 4 can hook the mount: */
+#define EEFS_NAND_MASK_BYTES / EEFS_NAND_MASK_TEST(m,i) / EEFS_NAND_MASK_SET(m,i)   /* entry bit masks (EntryMask, ForceDirty) */
+int32   EEFS_NandCheckGeometry(Vol);               /* 5.1 step 1 on Vol->Dev; fills the cached sizes; uses Vol->Base as scratch. SUCCESS / INVALID_ARGUMENT */
+uint32  EEFS_NandMaxCheckpointPages(Vol);          /* dry run of a CHECKPOINT with every entry in use and the full map */
+int32   EEFS_NandFormat(Vol);                      /* 5.1 steps 2-6 */
+int32   EEFS_NandMount(Vol);                       /* 5.2 steps 2-9 (step 5 returns EEFS_NOT_FORMATTED until phase 4) */
+boolean EEFS_NandHasUncommitted(Vol, boolean IncludeForceDirty);   /* Working != Base (entries, map, batch cleanup entries) */
+extern EEFS_FileDescriptor_t EEFS_FileDescriptorTable[];          /* declared in the internal header for Abort's busy check */
 ```
 
 ### 3.3 Allocation and lookup (`eefs_nand_fileapi.c`, phase 3; declared in the internal header so phases 4-6 use them)
@@ -868,8 +881,14 @@ int32   EEFS_NandReclaimOrphans(Vol);       /* 8.4 */
    it: `EEFS_IO_ERROR`. If one does: `EEFS_SUCCESS` (the other is resynced by the first commit).
 7. Zero `Scratch`.
 
-Power loss anywhere: either no valid checkpoint anywhere (mount returns `EEFS_NOT_FORMATTED`
-because there are no metadata pages either) or a valid empty volume.
+Power loss: on a blank device, either no valid checkpoint (mount returns `EEFS_NOT_FORMATTED`) or a
+valid empty volume. When a device that holds a volume is formatted again, blocks are erased in
+ascending order, so a cut while the directory region is being erased can leave the old volume
+mountable from the mirror that was not erased yet (the complete old state: its data blocks are erased
+later), and a cut while the data region is being erased leaves no directory but some old metadata
+pages: `EEFS_NOT_FORMATTED` until phase 4, after which the rebuild (8.1) would recover the old files
+that were not erased yet. In every case formatting again succeeds. (Tested by the `powercut_sweep_format`
+case: old volume, then `NOT_FORMATTED`, then empty, in that order, at every cut point.)
 
 ### 5.2 Mount (`EEFS_LibInitFS`)
 
@@ -943,10 +962,16 @@ A page that fails validation and is not erased stops the chain and sets `Torn` e
 followed by erased pages: the mirror will move to a new block (section 5.4) rather than program
 after a possibly half-programmed page.
 
+Ties (as delivered): two blocks of a mirror can carry a checkpoint with the same `Seq` (for example a
+resync checkpoint when the mirror's own chain already ended at that `Seq`). The scan therefore walks
+every candidate whose checkpoint `Seq` equals the best one found and keeps the longest chain (highest
+`LastSeq`), instead of stopping at the first valid candidate. `Torn` is also set when any candidate
+with a `Seq` at least that of the chosen checkpoint has an invalid checkpoint.
+
 ### 5.4 Commit (`EEFS_NandCommit`)
 
 ```
-if PendingCleanupCount > 0: EEFS_NandRunPendingCleanup           /* 5.6 */
+if PendingCleanupBase > 0: EEFS_NandRunPendingCleanup            /* 5.6 (it only handles the media-loaded entries) */
 EEFS_NandResync                                                   /* lagging/missing mirrors get a CHECKPOINT at Seq LastSeq */
 compute dirty: EntryMask, MapChanged, Cleanup = first blocks of FREEING slots... (collected during the batch in PendingCleanup, see below)
 if !ForceCheckpointBoth and no dirty entries and no changed map bytes and PendingCleanupCount == 0: return SUCCESS
@@ -956,12 +981,13 @@ written = 0
 for M in 0, 1:
     if Mirror[M].Disabled: continue
     rc = EEFS_NandWriteRecordToMirror(M, Seq, ForceCheckpointBoth, EntryMask, PendingCleanup, PendingCleanupCount)
-    if rc == SUCCESS: written++ else Mirror[M].NeedsResync = 1 (it will be resynced next time)
-if written == 0: Working.WriteSeqHigh = Base.WriteSeqHigh; return EEFS_IO_ERROR    /* nothing committed; Working intact (bad marks stay) */
+    if rc == SUCCESS: written++                 /* a failed mirror has EnterNewBlock set by the retry loop */
+if written == 0: Working.WriteSeqHigh = Base.WriteSeqHigh; update resync flags; return EEFS_IO_ERROR    /* nothing committed; Working intact (bad marks stay) */
 /* committed */
 for every b: if Working.Map[b] == FREEING: Working.Map[b] = FREE
 Base = Working; clear ForceDirty; LastSeq = Seq; DirectoryRebuilt = 0
-run cleanup now: for each b in PendingCleanup: if page 0 of b is not erased: EraseBlock(b) (failure -> MarkBad); PendingCleanupCount = 0
+update resync flags: for each enabled mirror, NeedsResync = EnterNewBlock = 1 iff !HasState or Mirror.LastSeq < LastSeq
+run cleanup now: for each b in PendingCleanup: if b is a data block, Working.Map[b] == FREE and page 0 of b is not erased: EraseBlock(b) (failure -> MarkBad); PendingCleanupCount = 0
 EEFS_NandTouch
 return SUCCESS
 ```
@@ -980,7 +1006,7 @@ allocation can hand out one of those blocks.
 retries = 0
 loop:
     Pages = EEFS_NandRecordPages(TXN...)
-    UseCheckpoint = Force || !Mirror[M].HasState || Mirror[M].EnterNewBlock || Mirror[M].NextPage + Pages > PagesPerBlock
+    UseCheckpoint = Force || !Mirror[M].HasState || Mirror[M].EnterNewBlock || Mirror[M].NeedsResync || Mirror[M].NextPage + Pages > PagesPerBlock
     if UseCheckpoint and (Mirror[M].HasState or Mirror[M].EnterNewBlock or page 0 of ring block CurIndex is not erased):
         if EEFS_NandEnterBlock(M) != SUCCESS: return EEFS_IO_ERROR          /* mirror Disabled */
     RecType = UseCheckpoint ? CHECKPOINT : TXN
@@ -993,6 +1019,14 @@ loop:
     Mirror[M].EnterNewBlock = 1
     if ++retries > EEFS_NAND_WRITE_RETRIES or Mirror[M].Disabled: return EEFS_IO_ERROR
 ```
+
+The resync flag rule (as delivered) replaces the first revision's "`NeedsResync = 1` on any failed
+mirror": a mirror is only resynced when it really lags, so a resync never writes a checkpoint whose
+`Seq` equals the mirror's own last record; a failed mirror that does not lag (nothing was committed)
+simply starts a new block with a CHECKPOINT at the next commit. `NeedsResync` also forces a CHECKPOINT
+in `EEFS_NandWriteRecordToMirror`, so a mirror whose resync failed is never given a TXN that cannot
+chain onto its records. `EEFS_NandResync` writes `State = Base` with the first `PendingCleanupBase`
+cleanup entries (none at commit time, since the pending cleanup has just run).
 
 `EEFS_NandEnterBlock(M)`: `CurIndex = (CurIndex + 1) % Count` (or 0 if `!HasState`), erase that
 block; on failure `MarkBad` it (the ring shrinks, indexes shift: recompute `CurIndex` to the block
@@ -1020,6 +1054,7 @@ if any open descriptor refers to (i,s) whose Working slot differs from Base slot
 for each (i,s) with Working.Entry[i].Slot[s].InUse and Working FirstBlock != Base FirstBlock (slot created or rewritten in the batch):
     best effort: erase Working FirstBlock only (its page 0 would otherwise be an orphan); failure -> MarkBad.
     Never touch the other blocks of the slot: with copy-on-write they may be shared with the committed copy.
+    (As delivered: only when FirstBlock is a data block that is FREE in Base and not BAD, and its page 0 is not erased.)
 for each b: if Working.Map[b] == BAD: keep; else Working.Map[b] = Base.Map[b]
 Working.Entry[] = Base.Entry[]; Working.WriteSeqHigh = Base.WriteSeqHigh
 PendingCleanupCount = count loaded at mount or left by the last commit that is still pending (i.e. remove entries added during the batch: the list is kept as [mount-pending | batch-added], tracked by PendingCleanupBase index)
@@ -1037,7 +1072,9 @@ Called at the top of **every mutating API** (WriteFile, Remove, Rename, SetFileA
 CopySlot(+All), Commit, RepairDirectory, ReclaimOrphans) when `PendingCleanupBase > 0`, before the
 operation allocates or changes anything: for each of the first `PendingCleanupBase` blocks: if its
 page 0 is not erased, erase it (failure -> `MarkBad`). Then remove them from the list and set
-`PendingCleanupBase = 0`. The list of a commit is executed inside that commit (5.4), so after a
+`PendingCleanupBase = 0`. As delivered, a listed block is only erased if it is a data block whose
+`Working.Map` byte is FREE (as FMT 4.3.4 guarantees for a well-formed record), so a corrupt or stale
+list can never erase a live file. `EEFS_NandAddCleanup` ignores a block that is already listed. The list of a commit is executed inside that commit (5.4), so after a
 clean commit nothing is pending. Mount never runs it.
 
 ## 6. File operations
@@ -1791,6 +1828,23 @@ commit for all torn modes: after reboot+mount the state equals exactly pre or po
 programs/erases; a following commit succeeds and both mirrors agree).
 
 Done when: `nand_journal_*` passes for all three geometries; `eeprom` tests still pass.
+
+As delivered: all the cases above, plus `mount_reconcile_follows_page0` (step 6 with synthetic slots: page 0 wins
+for ownership and copied fields, `ForceDirty` persists the repair, a destroyed page 0 flags the slot),
+`freefs_and_abort_busy_rules`, `ring_wraps_around_factory_bad_dir_blocks` (factory-bad blocks at the start and end
+of a mirror; the rings wrap around them and they are never erased), and these power-cut sweeps, each run for every
+cut point of the operation in all three torn modes, with the checks of the file header comment of
+`tests/nand/test_journal.c` (exactly pre or post state, monotonic in the cut point, remount reads only, every slot
+validates, a follow-up commit succeeds with both mirrors agreeing, cleanup done iff free): `powercut_sweep_commit`
+(modify + remove with cleanup + add), `powercut_sweep_commit_multipage_txn` (the same with a TXN of at least three
+pages), `powercut_sweep_commit_enters_block` (both mirrors full: erase + CHECKPOINT, with a factory-bad block
+skipped by the ring), `powercut_sweep_commit_with_resync` (mirror 1 one record behind),
+`powercut_sweep_pending_cleanup_then_commit`, `powercut_sweep_repair_directory`, `powercut_sweep_format` (on a
+64-block device that holds a volume), and two double-fault sweeps (`powercut_double_sweep_commit`,
+`powercut_double_sweep_enters_block`) that also cut the recovery commit at every point. The RTEMS NAND test formats
+and mounts through the driver, then commits, unmounts and remounts through the library. `EEFS_LibGetVolumeInfo` and
+the `EEFS_GetVolumeInfo` wrapper exist and return `EEFS_UNSUPPORTED_OPTION` until phase 3; mount sets
+`AllocCursor = DirRegionBlocks` until the phase 3 allocator seeds it.
 
 ### Phase 3: file operations
 

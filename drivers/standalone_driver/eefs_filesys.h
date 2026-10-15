@@ -172,6 +172,9 @@ int32                           EEFS_WriteFile(char *Path, const EEFS_NandFileIn
 int32                           EEFS_Commit(char *MountPoint);
 int32                           EEFS_Abort(char *MountPoint);
 
+/* Space and state of a volume */
+int32                           EEFS_GetVolumeInfo(char *MountPoint, EEFS_NandVolumeInfo_t *Info);
+
 /* Checks every CRC of a file / returns its directory entry and type info */
 int32                           EEFS_VerifyFile(char *Path);
 int32                           EEFS_GetFileInfo(char *Path, EEFS_NandFileInfo_t *Info);

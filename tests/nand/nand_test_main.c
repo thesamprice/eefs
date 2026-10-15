@@ -46,6 +46,7 @@ EEFS_NandGeometry_t         NandTest_Geo;
 static const NandTest_Suite_t NandTest_Suites[] = {
     { "layout", NandTest_LayoutCases },
     { "sim",    NandTest_SimCases },
+    { "journal", NandTest_JournalCases },
     { NULL,     NULL }
 };
 

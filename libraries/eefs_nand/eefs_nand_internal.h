@@ -30,6 +30,13 @@
 #include "eefs_nand_format.h"
 
 /*
+ * Exported Data
+ */
+
+/* The descriptor table shared by all volumes (eefs_nand_fileapi.c); Abort checks it for slots of the batch */
+extern EEFS_FileDescriptor_t    EEFS_FileDescriptorTable[EEFS_MAX_OPEN_FILES];
+
+/*
  * Exported Functions
  */
 
@@ -60,11 +67,38 @@ void            EEFS_NandMarkBad(EEFS_InodeTable_t *Vol, uint32 Block);
 /* Reads the OOB of every BadMarkerPages page (Data NULL); TRUE if any byte at BadMarkerOffset != 0xFF or a read fails */
 boolean         EEFS_NandHasBadMarker(EEFS_InodeTable_t *Vol, uint32 Block);
 
+/* TRUE if the data area of (Block, Page) reads as all 0xFF (uncached, into Vol->PageBuf); a read error counts as not
+ * erased */
+boolean         EEFS_NandPageIsErased(EEFS_InodeTable_t *Vol, uint32 Block, uint32 Page);
+
 /* Cached read + EEFS_NandDecodePage0(ExpectBlock = Block) + bounds check of every Blocks[i] (>= DirRegionBlocks,
  * < BlockCount).  EEFS_SUCCESS / EEFS_CORRUPT_FILE / EEFS_IO_ERROR.  *Raw = cache pointer for Blocks[] access. */
 int32           EEFS_NandReadPage0(EEFS_InodeTable_t *Vol, uint32 Block, EEFS_NandPage0_t *P, const uint8 **Raw);
 
 /* Journal (eefs_nand_journal.c, phase 2), section 3.2 */
+
+/* Bytes of an entry bit mask (EntryMask, ForceDirty) */
+#define EEFS_NAND_MASK_BYTES            ((EEFS_MAX_FILES + 7) / 8)
+#define EEFS_NAND_MASK_TEST(m, i)       (((m)[(i) / 8] & (uint8)(1u << ((i) % 8))) != 0)
+#define EEFS_NAND_MASK_SET(m, i)        ((m)[(i) / 8] |= (uint8)(1u << ((i) % 8)))
+
+/* Section 5.1 step 1: checks Vol->Dev (ops and geometry) and fills the cached sizes of Vol.  Uses Vol->Base as
+ * scratch (for MaxCheckpointPages), so it is called on a volume that is about to be (re)initialized.
+ * EEFS_SUCCESS or EEFS_INVALID_ARGUMENT. */
+int32           EEFS_NandCheckGeometry(EEFS_InodeTable_t *Vol);
+
+/* Pages of a CHECKPOINT with every entry in use and the full map (uses Vol->Base as scratch) */
+uint32          EEFS_NandMaxCheckpointPages(EEFS_InodeTable_t *Vol);
+
+/* Section 5.1 steps 2-6 on a volume prepared by EEFS_NandCheckGeometry */
+int32           EEFS_NandFormat(EEFS_InodeTable_t *Vol);
+
+/* Section 5.2 steps 2-9 on a volume prepared by EEFS_NandCheckGeometry.  EEFS_SUCCESS, EEFS_GEOMETRY_MISMATCH,
+ * EEFS_NOT_FORMATTED, EEFS_IO_ERROR. */
+int32           EEFS_NandMount(EEFS_InodeTable_t *Vol);
+
+/* TRUE if Working differs from Base (entries or map), or, with IncludeForceDirty, a ForceDirty bit is set */
+boolean         EEFS_NandHasUncommitted(EEFS_InodeTable_t *Vol, boolean IncludeForceDirty);
 
 int32           EEFS_NandBuildRings(EEFS_InodeTable_t *Vol);
 int32           EEFS_NandScanMirror(EEFS_InodeTable_t *Vol, uint8 M, EEFS_NandChain_t *C);
@@ -92,10 +126,28 @@ void            EEFS_NandDiff(EEFS_InodeTable_t *Vol, uint8 *EntryMask, uint32 *
 int32           EEFS_NandParseName(const char *Name, char *Path, uint8 *SlotSpec);
 int32           EEFS_NandFindEntry(EEFS_InodeTable_t *Vol, const char *Path);
 int32           EEFS_NandAllocEntry(EEFS_InodeTable_t *Vol);
-int32           EEFS_NandAllocBlocks(EEFS_InodeTable_t *Vol, uint32 Count, uint16 *Out, uint8 Owner);
+#define EEFS_NAND_ALLOC_NEW             0   /* new file, CopySlot: must leave >= EEFS_NAND_RESERVE_BLOCKS free */
+#define EEFS_NAND_ALLOC_MODIFY          1   /* copy-on-write modify, Rename, SetAttr: must leave >= EEFS_NAND_BADBLOCK_RESERVE free */
+#define EEFS_NAND_ALLOC_REPLACE         2   /* replacement for a grown bad block: may take the last free block */
+uint32          EEFS_NandFreeCount(EEFS_InodeTable_t *Vol);     /* Working.Map bytes == FREE in [DirRegionBlocks, BlockCount) */
+int32           EEFS_NandAllocBlocks(EEFS_InodeTable_t *Vol, uint32 Count, uint16 *Out, uint8 Owner, uint8 Class);
+
+/* Phase 2 implements the map/cleanup helpers below (ReleaseBlocks, FreeSlot, FreeBlocksExcept, Touch) */
+
+/* Back to FREE (a BAD block stays BAD) */
 void            EEFS_NandReleaseBlocks(EEFS_InodeTable_t *Vol, const uint16 *Blocks, uint32 Count);
+
+/* Every Working.Map byte == OWNER(Entry, Slot) -> FREEING; adds FirstBlock to the cleanup list (the caller checked
+ * room); zeroes the slot record */
 void            EEFS_NandFreeSlot(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot);
+
+/* Every Working.Map byte == OWNER(Entry, Slot) whose block is not in Keep[] -> FREEING (copy-on-write).  Keep[] must
+ * list blocks owned by the slot. */
+void            EEFS_NandFreeBlocksExcept(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot, const uint16 *Keep, uint32 KeepCount);
+
 uint32          EEFS_NandBlocksNeeded(EEFS_InodeTable_t *Vol, uint32 Size);
+boolean         EEFS_NandBlockUnchanged(EEFS_InodeTable_t *Vol, uint16 OldBlock, uint32 K, uint32 OldCrc, uint32 OldLen,
+                                        const uint8 *NewSlice, uint32 NewLen);
 int32           EEFS_NandValidateSlot(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot, boolean Full);
 int32           EEFS_NandWriteCopy(EEFS_InodeTable_t *Vol, uint32 SrcEntry, uint8 SrcSlot, EEFS_NandPage0_t *NewP0, uint16 *DstBlocks);
 void            EEFS_NandTouch(EEFS_InodeTable_t *Vol);

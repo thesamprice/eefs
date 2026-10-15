@@ -570,4 +570,4 @@ page buffer re-reads page 0 at each block transition; it is one extra page read 
 | Commit, between mirror 0 and mirror 1 | Mirror 0 ends with `S`, mirror 1 with `S-1`. The state is `S`. The library brings mirror 1 up to date with a checkpoint at its next commit. |
 | Commit, during cleanup | State `S`, pending cleanup in the newest record. The library finishes it before its next write. |
 | Entering a new ring block (erase, or writing the checkpoint) | The previous block still holds the complete state `S-1`. |
-| Format | Either no valid checkpoint (`EEFS_NOT_FORMATTED`, format again) or a complete empty volume. |
+| Format | Either no valid checkpoint (`EEFS_NOT_FORMATTED`, format again) or a complete empty volume. When an existing volume is formatted again, a cut while the directory region is being erased can also leave the complete old volume (from the mirror not yet erased). |
