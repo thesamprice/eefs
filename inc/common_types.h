@@ -96,8 +96,19 @@
 
    typedef unsigned char                        boolean;
 
-#else  /* not any of the above */
-   #error undefined processor
+#else  /* not any of the above: ARM, AArch64, RISC-V, MicroBlaze, ... */
+   /* Take the endianness from the compiler when it says (GCC and Clang do) */
+   #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+      #define _STRUCT_HIGH_BIT_FIRST_
+      #undef  _STRUCT_LOW_BIT_FIRST_
+   #else
+      #undef  _STRUCT_HIGH_BIT_FIRST_
+      #define _STRUCT_LOW_BIT_FIRST_
+   #endif
+
+#ifndef _USING_RTEMS_INCLUDES_
+   typedef unsigned char                        boolean;
+#endif
 #endif  /* processor types */
 
 /*
