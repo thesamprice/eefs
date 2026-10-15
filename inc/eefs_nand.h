@@ -104,11 +104,19 @@ int32   EEFS_LibCopySlotAll(EEFS_InodeTable_t *InodeTable, uint8 From, uint8 To)
 /* Directory maintenance */
 int32   EEFS_LibRepairDirectory(EEFS_InodeTable_t *InodeTable);    /* commit + fresh CHECKPOINT in both mirrors */
 int32   EEFS_LibRebuildDirectory(EEFS_InodeTable_t *InodeTable);   /* rebuild the RAM directory from the metadata pages */
-int32   EEFS_LibReclaimOrphans(EEFS_InodeTable_t *InodeTable);     /* >= 0 blocks erased, or EEFS_IO_ERROR */
+/* Erases the data blocks that are free (Working and Base), not on the cleanup list, and hold a valid metadata page.
+ * >= 0 blocks erased (a failed erase marks the block bad and is not counted), EEFS_READ_ONLY_FILE_SYSTEM. */
+int32   EEFS_LibReclaimOrphans(EEFS_InodeTable_t *InodeTable);
 
-/* Health check (resumable; the lock is held only inside Step) */
+/* Health check (docs/nand-implementation.md section 10).  Resumable: Step holds the lock only for at most
+ * MaxPageReads page reads (0 counts as 1) and the check restarts by itself after any change of the volume, so a
+ * low-priority task can run it after every boot.  It never writes NAND; a copy that fails is flagged as a failed
+ * validation would flag it (ActiveFailed for the active copy of an A/B file, persisted by the next commit).
+ * Start: EEFS_SUCCESS, EEFS_DEVICE_IS_BUSY (a check is attached).  Step: 1 = more, EEFS_SUCCESS = done (the report is
+ * complete and is the volume's last report), EEFS_INVALID_ARGUMENT (no check attached).  Summary: the last completed
+ * report, EEFS_ERROR if none since the mount.  Cancel: detaches the check (EEFS_SUCCESS also when none). */
 int32   EEFS_LibHealthCheckStart(EEFS_InodeTable_t *InodeTable, EEFS_HealthReport_t *Report);
-int32   EEFS_LibHealthCheckStep(EEFS_InodeTable_t *InodeTable, uint32 MaxPageReads);     /* 1 = more, EEFS_SUCCESS = done */
+int32   EEFS_LibHealthCheckStep(EEFS_InodeTable_t *InodeTable, uint32 MaxPageReads);
 int32   EEFS_LibHealthCheckSummary(EEFS_InodeTable_t *InodeTable, EEFS_HealthSummary_t *Out);
 int32   EEFS_LibHealthCheckCancel(EEFS_InodeTable_t *InodeTable);
 

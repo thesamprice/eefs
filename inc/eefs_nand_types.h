@@ -189,7 +189,9 @@ typedef struct
     uint16                              CurBlock;
 } EEFS_FileDescriptor_t;
 
-/* Resumable health check state (docs/nand-implementation.md section 10) */
+/* Resumable health check state (docs/nand-implementation.md section 10).  The caller owns the memory and must not
+ * change it while the check is attached to a volume; S may be read between steps (a snapshot carries
+ * EEFS_HEALTH_INCOMPLETE).  Every cursor lives here, so the check can stop after any page read and resume. */
 typedef struct EEFS_HealthReport
 {
     EEFS_HealthSummary_t                S;
@@ -202,8 +204,27 @@ typedef struct EEFS_HealthReport
     uint32                              Page, Block, DataOffset;
     uint32                              RunBlockCrc, RunFileCrc, MaxCorrectedInBlock;
     uint32                              ExpectBlockCrc;
+    uint32                              StepReads;          /* page reads in the current step */
+    uint8                               Marker;             /* bad-marker page cursor (index into the marker pages) */
+    uint8                               Verdict;            /* phase 2: 1 ok so far, 2 corrupt (page 0 disagrees with the entry) */
+    uint8                               FirstActive;        /* phase 3: ActiveSlot of the first A/B entry, 0xFF none yet */
+    uint8                               Reserved;
+    uint32                              K;                  /* phase 2: index into Blocks[] */
+    uint32                              FirstBlock, BlockCount, FileSize, FileCrc32;   /* phase 2: the slot's page 0 */
+    /* phase 1: the chain walk of one candidate block */
+    uint32                              WalkBlock, WalkPage, WalkSub, WalkRecSeq, WalkRecCount, WalkLast, WalkCkpt;
+    uint8                               WalkValid, WalkTail;    /* WalkTail: 0 none, else the finding code of the page after the chain */
+    uint8                               TornCand[2];        /* phase 1: a candidate of the mirror had a torn checkpoint */
+    uint32                              WalkTailPage, WalkTailSeq;
+    uint32                              ChainBlock[2];      /* block of each mirror's chosen chain */
+    uint8                               ChainTail[2];       /* finding code for the page after the chosen chain, 0 none */
+    uint8                               Reserved2[2];
+    uint32                              ChainTailPage[2], ChainTailSeq[2];
     uint32                              CandSeq[EEFS_NAND_MAX_DIR_BLOCKS];      /* phase 1 scratch */
+    uint8                               CandState[EEFS_NAND_MAX_DIR_BLOCKS];    /* 0 none, 1 candidate, 2 walked, 3 torn */
     EEFS_NandChain_t                    Chain[2];
+    uint8                               FailedAtStart[(EEFS_MAX_FILES + 7) / 8];  /* ActiveFailed when the check (re)started */
+    uint8                               SetByCheck[(EEFS_MAX_FILES + 7) / 8];     /* ActiveFailed set by this check (kept across restarts) */
     uint8                               Claimed[(EEFS_NAND_MAX_BLOCKS + 7) / 8]; /* blocks claimed by a validated page 0 */
     uint8                               SlotResult[EEFS_MAX_FILES][2];          /* 0 unchecked, 1 ok, 2 corrupt, 3 io error, 4 not in use */
 } EEFS_HealthReport_t;

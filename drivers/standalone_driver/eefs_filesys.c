@@ -949,6 +949,16 @@ int32 EEFS_HealthCheckSummary(char *MountPoint, EEFS_HealthSummary_t *Out)
     return(EEFS_LibHealthCheckSummary(&Device->InodeTable, Out));
 }
 
+/* Detaches the running health check of a volume */
+int32 EEFS_HealthCheckCancel(char *MountPoint)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibHealthCheckCancel(&Device->InodeTable));
+}
+
 /* Splits Path and finds the device of its mount point */
 static int32 EEFS_ResolvePath(char *Path, EEFS_SplitPath_t *SplitPath, EEFS_Device_t **Device)
 {

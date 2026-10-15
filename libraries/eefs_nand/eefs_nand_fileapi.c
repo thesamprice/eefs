@@ -121,7 +121,6 @@ static int32                    EEFS_NandResolve(EEFS_InodeTable_t *Vol, char *N
                                                  uint8 *SlotSpec);
 static int32                    EEFS_NandValidateSlotP0(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot, boolean Full,
                                                         EEFS_NandPage0_t *P);
-static void                     EEFS_NandSlotFailed(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot);
 static int32                    EEFS_NandReadSlotPage0(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot,
                                                        EEFS_NandPage0_t *P, const uint8 **Raw);
 static int32                    EEFS_NandWriteAttempt(EEFS_InodeTable_t *Vol, EEFS_NandWriteJob_t *Job, uint32 *BadK);
@@ -1826,8 +1825,9 @@ static int32 EEFS_NandReadSlotPage0(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 
 
 } /* End of EEFS_NandReadSlotPage0() */
 
-/* A slot failed validation: SLOTFLAG_CORRUPT, and ActiveFailed for the active copy of an A/B entry (section 6.4) */
-static void EEFS_NandSlotFailed(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot)
+/* A slot failed validation: SLOTFLAG_CORRUPT, and ActiveFailed for the active copy of an A/B entry (section 6.4).  Also
+ * used by the health check for a slot that fails its checks. */
+void EEFS_NandSlotFailed(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot)
 {
     EEFS_NandEntry_t   *W = &Vol->Working.Entry[Entry];
     EEFS_NandEntry_t   *B = &Vol->Base.Entry[Entry];

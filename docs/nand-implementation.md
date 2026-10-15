@@ -623,13 +623,13 @@ int32 EEFS_LibCopySlotAll(EEFS_InodeTable_t *T, uint8 From, uint8 To);          
 /* Directory maintenance. Section 8. */
 int32 EEFS_LibRepairDirectory(EEFS_InodeTable_t *T);     /* commits pending changes and writes a fresh CHECKPOINT to both mirrors; clears DirectoryRebuilt. SUCCESS, IO_ERROR */
 int32 EEFS_LibRebuildDirectory(EEFS_InodeTable_t *T);    /* discards RAM directory state (requires no open files/dir and no uncommitted changes) and rebuilds from page 0s. SUCCESS, DEVICE_IS_BUSY, TRANSACTION_ERROR, NOT_FORMATTED, IO_ERROR */
-int32 EEFS_LibReclaimOrphans(EEFS_InodeTable_t *T);      /* erases blocks with a valid page 0 that no Working slot references. >= 0 blocks erased, or IO_ERROR */
+int32 EEFS_LibReclaimOrphans(EEFS_InodeTable_t *T);      /* erases blocks with a valid page 0 that no Working slot references. >= 0 blocks erased, or READ_ONLY_FILE_SYSTEM (as delivered, 8.4) */
 
 /* Health check. Section 10. */
 int32 EEFS_LibHealthCheckStart(EEFS_InodeTable_t *T, EEFS_HealthReport_t *Report);   /* SUCCESS, DEVICE_IS_BUSY (another report active on T) */
 int32 EEFS_LibHealthCheckStep(EEFS_InodeTable_t *T, uint32 MaxPageReads);            /* 1 = more, EEFS_SUCCESS = done, INVALID_ARGUMENT (not started) */
 int32 EEFS_LibHealthCheckSummary(EEFS_InodeTable_t *T, EEFS_HealthSummary_t *Out);   /* copy of the last completed report; SUCCESS, EEFS_ERROR if none completed yet */
-int32 EEFS_LibHealthCheckCancel(EEFS_InodeTable_t *T);                                /* detaches ActiveReport */
+int32 EEFS_LibHealthCheckCancel(EEFS_InodeTable_t *T);                                /* detaches ActiveReport; SUCCESS (also when none) */
 ```
 
 The existing `EEFS_Lib*` prototypes keep their signatures. NAND semantics:
@@ -686,6 +686,7 @@ int32 EEFS_ReclaimOrphans(char *MountPoint);
 int32 EEFS_HealthCheckStart(char *MountPoint, EEFS_HealthReport_t *Report);
 int32 EEFS_HealthCheckStep(char *MountPoint, uint32 MaxPageReads);
 int32 EEFS_HealthCheckSummary(char *MountPoint, EEFS_HealthSummary_t *Out);
+int32 EEFS_HealthCheckCancel(char *MountPoint);                 /* added in phase 6 */
 #endif
 ```
 
@@ -854,7 +855,10 @@ int32   EEFS_NandReclaimOrphans(Vol);       /* 8.4 */
 - `VolumeChangeCounter` increments on every call that changes `Working`, `Base`, `SlotFlags`, the
   map or the media (WriteFile, Remove, Rename, SetFileAttributes, CopySlot(+All), SetActiveSlot(+All),
   SetFallbackCompatible(+All), SetFailed, ClearFailed, Commit, Abort, RepairDirectory,
-  RebuildDirectory, ReclaimOrphans, MarkBad, and VerifyFile/Open when they set a flag).
+  RebuildDirectory, ReclaimOrphans, MarkBad, and VerifyFile/Open when they set a flag). As delivered
+  (phase 6), `EEFS_NandProgramPageVerified` and `EEFS_NandEraseBlock` also bump it, so every media change
+  (including the pending-cleanup erases at the start of a mutating call and the programs of a write that
+  later fails) restarts a running health check, whichever call made it.
 
 ## 5. Directory algorithms
 
@@ -1491,6 +1495,13 @@ FREE`: read page 0; if it is a valid metadata page (any content), erase `b` (fai
 touched, so a batch in progress is safe. Returns the number erased. Reads `BlockCount -
 DirRegionBlocks` pages and holds the lock throughout.
 
+As delivered (phase 6): a block is erased only if it is FREE in both `Working` and `Base` (as the allocator
+requires), is not on the pending cleanup list (either part), and `EEFS_NandReadPage0` validates its page 0
+(FMT 3.4 with `ExpectBlock = b`; a factory-bad block fails the read and is skipped). A failed erase marks the
+block bad and is not counted, so `EEFS_IO_ERROR` is never returned; `EEFS_READ_ONLY_FILE_SYSTEM` is returned
+when `EEFS_LIB_IS_WRITE_PROTECTED`. The volume is touched only when something was erased. The internal
+`EEFS_NandReclaimOrphans` does the work under the caller's lock.
+
 ## 9. Bootloader library (`libraries/microeefs_nand`)
 
 Links only `microeefs_nand.c`, `eefs_nand_format.c`, `eefs_crc32.c`. No globals except the hook
@@ -1606,11 +1617,24 @@ typedef struct EEFS_HealthReport {
     uint32  Page, Block, DataOffset;
     uint32  RunBlockCrc, RunFileCrc, MaxCorrectedInBlock;
     uint32  ExpectBlockCrc;
-    uint32  CandSeq[EEFS_NAND_MAX_DIR_BLOCKS];       /* phase 1 scratch */
+    /* added in phase 6: every cursor of the resumable check */
+    uint32  StepReads;                                   /* page reads in the current step */
+    uint8   Marker, Verdict, FirstActive, Reserved;      /* bad-marker page cursor; phase 2 slot verdict; phase 3 LOAD_MIXED state */
+    uint32  K, FirstBlock, BlockCount, FileSize, FileCrc32;           /* phase 2: Blocks[] index and the slot's page 0 */
+    uint32  WalkBlock, WalkPage, WalkSub, WalkRecSeq, WalkRecCount, WalkLast, WalkCkpt;   /* phase 1 chain walk */
+    uint8   WalkValid, WalkTail, TornCand[2];
+    uint32  WalkTailPage, WalkTailSeq;
+    uint32  ChainBlock[2];
+    uint8   ChainTail[2], Reserved2[2];
+    uint32  ChainTailPage[2], ChainTailSeq[2];
+    uint32  CandSeq[EEFS_NAND_MAX_DIR_BLOCKS];           /* phase 1 scratch */
+    uint8   CandState[EEFS_NAND_MAX_DIR_BLOCKS];         /* 0 none, 1 candidate, 2 walked, 3 torn */
     EEFS_NandChain_t Chain[2];
-    uint8   Claimed[EEFS_NAND_MAX_BLOCKS / 8];       /* blocks claimed by a validated page 0 */
-    uint8   SlotResult[EEFS_MAX_FILES][2];           /* 0 unchecked, 1 ok, 2 corrupt, 3 io error, 4 not in use */
-} EEFS_HealthReport_t;                               /* ~3.3 KB */
+    uint8   FailedAtStart[(EEFS_MAX_FILES + 7) / 8];     /* ActiveFailed when the check (re)started */
+    uint8   SetByCheck[(EEFS_MAX_FILES + 7) / 8];        /* ActiveFailed set by this check (kept across restarts) */
+    uint8   Claimed[EEFS_NAND_MAX_BLOCKS / 8];           /* blocks claimed by a validated page 0 */
+    uint8   SlotResult[EEFS_MAX_FILES][2];               /* 0 unchecked, 1 ok, 2 corrupt, 3 io error, 4 not in use */
+} EEFS_HealthReport_t;                               /* ~3.5 KB at the defaults */
 ```
 
 ### 10.2 Protocol
@@ -1703,6 +1727,72 @@ table.
 Cost: phase 1 <= `DirRegionBlocks + 4 x PagesPerBlock`; phase 2 = every data page of every slot +
 `BlockCount` page-0 re-reads at most; phase 4 = `BlockCount - DirRegionBlocks`.
 
+### 10.4 As delivered (phase 6)
+
+Structure. Every unit of work reads at most one page, uncached, into `Vol->PageBuf` (or the OOB into
+`Vol->OobBuf`), finishes with it and keeps everything it needs in the report, so a step can end after any read
+and the report does not depend on `MaxPageReads` (the `health_maxpagereads_1_equals_one_big_step` case compares
+1, 13 and unlimited). `Step` runs units while `StepReads < MaxPageReads`; with `MaxPageReads = 1` a check takes
+`PagesRead + 1` steps. `PagesRead` counts every HAL read of the check; `CorrectedBits` sums the corrected bits
+of the data reads (an OOB-only marker read reports none).
+
+Restart. `H_Begin` keeps `Restarts`, `Steps` and `SetByCheck`, clears the rest. `AB_FAILED_FLAG_SET` means
+"set before this check looked": `FailedAtStart` is taken at every (re)start and excludes the flags this check set
+itself (`SetByCheck`), so a restart does not turn the check's own finding into `AB_FAILED_FLAG_SET`; a new check
+started later does report it. The check's own flagging (`EEFS_NandSlotFailed`, now exported from
+`eefs_nand_fileapi.c`) bumps the change counter, which the check puts back so that it never restarts itself.
+
+Bad-block markers (phases 1 and 4). A block whose map value is `BAD` is skipped (no read). Otherwise each
+`BadMarkerPages` page is read OOB-only (`Data = NULL`, as `EEFS_NandHasBadMarker` and the HAL contract require
+for factory-bad blocks); a marker byte other than `0xFF` gives `BADBLOCK_UNRECORDED` and the block is not looked
+at further. A failed OOB read is not reported as a marker (the page 0 read reports the block). The cost of phases
+1 and 4 is therefore one read per marker page more per block than 10.3 says.
+
+Phase 1. Candidates are the directory blocks that are not `BAD`, by the 5.3 rules (highest `Seq` first, the lower
+block on a tie, the walk stops below the chosen checkpoint, equal `Seq` candidates are all walked and the longest
+chain wins). The page where the chosen chain stops is classified during the walk, without a re-read: erased =
+nothing; a record whose first page is valid but a later page is not = `DIR_UNCOMMITTED_TXN` (`Aux0` = its first
+page, `Aux1` = its `Seq`); a page that fails validation but whose raw header has the record magic, layout version,
+`PageIndex 0` and `Seq = LastSeq + 1` = `DIR_UNCOMMITTED_TXN`; anything else, including a read error =
+`DIR_RECORD_CORRUPT` (`Aux0` = page, `Aux1` = 0). A candidate whose checkpoint is torn gives
+`DIR_UNCOMMITTED_TXN` (`Aux0 = 0`, `Aux1` = its `Seq`) only when its `Seq` is strictly above the chosen
+checkpoint's (an abandoned block with an equal `Seq` is harmless). These findings carry `Slot` = mirror and
+`Block` = the directory block. `DIR_MIRROR_MISMATCH` carries `Slot` = the lagging mirror.
+
+Phase 2. The per-slot verdict is what `EEFS_NandValidateSlot(Full = TRUE)` would decide: a page 0 that fails
+FMT 3.4 (`FILE_CORRUPT`, `Aux0 0`) or cannot be read (`FILE_IO_ERROR`, `Aux0 0`), a block or file CRC mismatch
+or an uncorrectable data page fail the slot, and so does `DIR_PAGE0_MISMATCH` with reason 1 (`Path`) or 2
+(`Slot`), since such a page is not this copy (Open and the bootloader refuse it); reasons 3 and 4 do not (the
+content is checked and may be good). Only the first reason found is reported (the finding is deduplicated per
+code, entry, slot and block). A failed slot gets `EEFS_NandSlotFailed` (SLOTFLAG_CORRUPT; for the active copy of
+an A/B entry `ActiveFailed` in Working, and in Base when Base holds the same slot record, with `ForceDirty`); a
+good one has SLOTFLAG_CORRUPT cleared, as `EEFS_NandValidateSlot` does. A listed block already claimed gives
+`BLOCK_CROSSLINKED` (`Aux0` = its map value) and is not checked against the map again; otherwise a map value
+other than `OWNER(i, s)` gives `MAP_MISMATCH` (`Aux0` = map value, `Aux1` = owner). `MAP_MISMATCH` carries no
+entry or slot (`0xFFFF`/`0xFF`, path ""). The page 0 re-read at a block transition is also re-validated (a page
+that no longer decodes, or whose `BlockCount` changed, fails the slot with `FILE_CORRUPT Aux0 0`).
+`BLOCK_NEEDS_SCRUB` uses the maximum corrected bits of the block's data reads (and page 0 for `Blocks[0]`).
+
+Phase 3. The A/B findings carry `EntryIndex`, `Path` and: `AB_A/B_CORRUPT` and `AB_ACTIVE_CORRUPT` `Slot` = the
+copy and `Block` = its first block; `AB_ACTIVE_MISSING` and `AB_FAILED_FLAG_SET` `Slot` = the active slot;
+`AB_FALLBACK_UNAVAILABLE` `Slot` = the inactive slot; `AB_VERSION_MISMATCH` `Slot 0xFF`; `AB_LOAD_MIXED` (one per
+volume) `Slot` = that entry's active slot, `Aux0` = the first A/B entry's active slot, `Aux1` = this one's.
+`ActiveFailed` for `AB_ACTIVE_CORRUPT` was already set by the phase 2 verdict (same path as a failed
+validation).
+
+Phase 4. Page 0 is read only for blocks that no valid page 0 claimed and that are not on the pending cleanup list
+(either part): a claimed block cannot be an orphan, and a listed block is a superseded first block (copy-on-write
+modify, Rename, SetFileAttributes, CopySlot replacing a copy, Remove), reported by phase 1 as `DIR_CLEANUP_PENDING`
+when it comes from the media and never as an orphan or a cross-link, even when its `Blocks[]` lists blocks that
+are free now. `ORPHAN_FILE` carries `Slot` = the page's `Slot` (`0xFF` for a single copy), `Aux0` = its `WriteSeq`,
+the page's path, no entry.
+
+Summary bits are accumulated as findings are added, also for findings that no longer fit (`Overflow` counts those,
+duplicates of a dropped finding included). `FREE_BELOW_RESERVE` carries no slot, entry or block.
+
+Cancel returns `EEFS_SUCCESS` whether or not a check was attached. `Start` on an unmounted volume is
+`EEFS_INVALID_ARGUMENT`. The driver gained `EEFS_HealthCheckCancel(MountPoint)`.
+
 ## 11. Simulator (`tests/nand/nand_sim.[ch]`)
 
 Host-only (uses `calloc`/`free`); also compiled into the RTEMS test. Implements
@@ -1782,7 +1872,13 @@ added to the API for that purpose, and run for `TornMode` NONE, PARTIAL and GARB
 
 Every public function takes `EEFS_LIB_LOCK` on entry and releases on exit, as the EEPROM backend
 does, including the long ones (WriteFile, CopySlot, Rename, Commit, ReclaimOrphans). The health
-check holds it only inside `Step`. The descriptor table and the single directory descriptor are
+check holds it only inside `Step`.
+
+As delivered (phase 6): the standalone driver's `eefs_macros.h` leaves `EEFS_LIB_LOCK` empty (single-task use)
+unless `EEFS_LIB_LOCK_HOOKS` is defined, in which case the macros call `EEFS_LibLockHook()` and
+`EEFS_LibUnlockHook()`, which the application provides; they must implement one library-wide recursive mutex
+(on RTEMS a binary semaphore with priority inheritance). The RTEMS NAND test builds its own copy of the library
+with the hooks (`eefs_rtems_locked` in `tests/rtems/CMakeLists.txt`); the `eefs` target is unchanged. The descriptor table and the single directory descriptor are
 shared across volumes exactly as in the EEPROM backend (same globals, same helper functions
 re-implemented in `eefs_nand_fileapi.c`).
 
@@ -2162,6 +2258,55 @@ run the check to completion and compare to the expected set derived from pre/pos
 `reclaim_orphans_erases_only_unreferenced`.
 
 Done when: `nand_health_*` passes.
+
+As delivered: `eefs_nand_health.c` (section 10, with the details of 10.4), `EEFS_LibReclaimOrphans` in
+`eefs_nand_rebuild.c` (8.4), the driver wrapper `EEFS_HealthCheckCancel`, the `EEFS_LIB_LOCK_HOOKS` option of the
+standalone `eefs_macros.h` (section 13), the change counter bumped by every program and erase (section 4), and
+`EEFS_NandSlotFailed` exported for the health check. Suite `health` (`tests/nand/test_health.c`, all three
+geometries; the finding cases run on a device of `DirRegionBlocks + 112` blocks, the clean case also on the
+full-size one) has the cases above, with these differences: `health_ab_b_corrupt` and
+`health_ab_active_corrupt_sets_flag` are one case, `health_ab_b_corrupt_and_active_corrupt_sets_flag`, run for a
+corrupt page 0, a data CRC and an uncorrectable data page of the active copy B (the flag is set by the check also
+in the default build where Open checks page 0 only, survives Abort, is persisted by the commit, is reported as
+`AB_FAILED_FLAG_SET` by the next check, and the bootloader falls back to A); the `DIR_UNCOMMITTED_TXN` case covers
+a real commit cut after the first page of a multi-page TXN, a page with a readable header but a broken CRC, a
+two-page record whose second page is missing and a torn checkpoint above the chain;
+`health_restart_on_commit_during_check` is `health_restart_on_change_during_check` (restarts after an uncommitted
+WriteFile, a commit, and a rewrite + commit of the file being checked; an empty commit does not restart it; the
+check setting `ActiveFailed` does not restart it; the final report is exact); and there are
+`health_cow_superseded_page0_not_orphan_or_crosslink` (modify + rename + CopySlot replacing a copy, also checked
+while the batch is open), `health_cancel_and_summary`, `health_findings_overflow` (40 orphans: 32 findings,
+`Overflow` 8), `reclaim_orphans_erases_only_unreferenced` (per-block erase counts; a FREEING page 0 missing from
+the cleanup list and a listed free block are each protected on their own) and
+`reclaim_orphans_powercut_sweep_no_damage`. Every check run verifies the protocol: each step reads at most
+`MaxPageReads` pages, `PagesRead` equals the HAL reads, nothing is programmed or erased, the volume's summary equals
+the report, and the summary bits follow from the codes. The power-cut sweep runs the `powercut` batch on every
+program and erase in the three torn modes and compares the report after the remount with expectations derived
+from the raw media: an orphan for every unclaimed, unlisted valid metadata page (always a block of the batch),
+`DIR_CLEANUP_PENDING` for the listed blocks from the media that still hold a page 0, `BADBLOCK_UNRECORDED` for
+the marker bytes a GARBAGE-torn erase leaves in the OOB, `DIR_MIRROR_MISMATCH` when the mirrors' chains end at
+different `Seq`, a torn-tail finding for exactly the mirrors whose scan is `Torn`, and nothing else; then
+ReclaimOrphans erases exactly the orphans, and after a follow-up commit only the torn-erase markers remain. The
+RTEMS NAND test runs the check in a priority-200 task with `MaxPageReads` 4 and a one-tick sleep between steps
+while a priority-50 task writes and commits three files; a HAL wrapper releases the writer from inside the health
+task's page reads, so every write waits for the lock once (priority inheritance), the check restarts three times
+and ends with the expected two findings for a decayed inactive copy.
+
+Mutations run and reverted (each failed at least one `health` case): pending-cleanup blocks reported as
+orphans; only the media part of the cleanup list excluded from the orphan scan; no restart on a volume change;
+a failed active copy not setting `ActiveFailed`; the check's own flagging restarting it; page reads not counted
+against `MaxPageReads`; ReclaimOrphans erasing FREEING blocks, ignoring the cleanup list, or erasing any free
+block.
+
+Notes for phase 8:
+
+- The health check runs for real only with a lock: an application with several tasks must define
+  `EEFS_LIB_LOCK_HOOKS` (or its own `eefs_macros.h`); `tests/rtems/eefs_rtems_nand_test.c` shows the hooks and the
+  RTEMS configuration (3 tasks, 3 semaphores, 1 ms tick).
+- The report memory (`EEFS_HealthReport_t`, ~3.5 KB) is the caller's and must stay untouched while attached.
+- After a power cut in the GARBAGE torn mode of the simulator, an interrupted erase leaves non-0xFF bytes in the
+  OOB marker position, which the check reports as `BADBLOCK_UNRECORDED` until the block is erased again.
+- `PagesRead` of a clean volume is computed exactly by `H_ExpectedReads` in `test_health.c` (section 10.4 rules).
 
 ### Phase 7: bootloader library
 

@@ -199,6 +199,7 @@ int32                           EEFS_ReclaimOrphans(char *MountPoint);
 int32                           EEFS_HealthCheckStart(char *MountPoint, EEFS_HealthReport_t *Report);
 int32                           EEFS_HealthCheckStep(char *MountPoint, uint32 MaxPageReads);
 int32                           EEFS_HealthCheckSummary(char *MountPoint, EEFS_HealthSummary_t *Out);
+int32                           EEFS_HealthCheckCancel(char *MountPoint);
 #endif
 
 #endif 

@@ -46,6 +46,7 @@ EEFS_NandGeometry_t         NandTest_Geo;
 extern const NandTest_Case_t NandTest_MicroCases[];     /* test_micro.c */
 extern const NandTest_Case_t NandTest_AbCases[];        /* test_ab.c */
 extern const NandTest_Case_t NandTest_RebuildCases[];   /* test_rebuild.c */
+extern const NandTest_Case_t NandTest_HealthCases[];    /* test_health.c */
 
 static const NandTest_Suite_t NandTest_Suites[] = {
     { "layout", NandTest_LayoutCases },
@@ -56,6 +57,7 @@ static const NandTest_Suite_t NandTest_Suites[] = {
     { "powercut", NandTest_PowercutCases },
     { "ab",     NandTest_AbCases },
     { "rebuild", NandTest_RebuildCases },
+    { "health", NandTest_HealthCases },
     { NULL,     NULL }
 };
 

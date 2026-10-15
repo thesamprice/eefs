@@ -35,7 +35,9 @@
  *   EEFS_LibRebuildDirectory) sets DirectoryRebuilt, LastSeq and the mirror state, then runs the rest of the mount
  *   (reconcile, Base, the allocation cursor and NextWriteSeq).
  *
- *   EEFS_LibReclaimOrphans is phase 6 and still returns EEFS_UNSUPPORTED_OPTION.
+ *   EEFS_LibReclaimOrphans (8.4) scans the data area itself (it does not trust a possibly stale health report) and
+ *   erases only blocks that are free in both Working and Base, are not on the pending cleanup list, and hold a valid
+ *   metadata page; owned, FREEING and listed blocks are never touched, so an open batch is safe.
  *
  */
 
@@ -196,15 +198,69 @@ int32 EEFS_LibRebuildDirectory(EEFS_InodeTable_t *InodeTable)
 
 } /* End of EEFS_LibRebuildDirectory() */
 
-/* Erases free blocks that still hold a valid metadata page (section 8.4).  Not implemented yet (phase 6). */
+/* Erases the orphans: data blocks that are free (in Working and Base) and still hold a valid metadata page (section
+ * 8.4).  Owned blocks (also those of the open batch), FREEING blocks and blocks on the pending cleanup list are never
+ * touched.  A failed erase marks the block bad.  Returns the number of blocks erased. */
 int32 EEFS_LibReclaimOrphans(EEFS_InodeTable_t *InodeTable)
 {
+    int32   ReturnCode;
+
     if (InodeTable == NULL) {
         return(EEFS_INVALID_ARGUMENT);
     }
-    return(EEFS_UNSUPPORTED_OPTION);
+
+    EEFS_LIB_LOCK;
+    if ((InodeTable->Mounted == 0) || (InodeTable->Dev == NULL)) {
+        ReturnCode = EEFS_INVALID_ARGUMENT;
+    }
+    else if (EEFS_LIB_IS_WRITE_PROTECTED != FALSE) {
+        ReturnCode = EEFS_READ_ONLY_FILE_SYSTEM;
+    }
+    else {
+        ReturnCode = EEFS_NandReclaimOrphans(InodeTable);
+    }
+    EEFS_LIB_UNLOCK;
+    return(ReturnCode);
 
 } /* End of EEFS_LibReclaimOrphans() */
+
+/* EEFS_LibReclaimOrphans under the lock */
+int32 EEFS_NandReclaimOrphans(EEFS_InodeTable_t *Vol)
+{
+    const EEFS_NandGeometry_t  *Geo = &Vol->Dev->Geometry;
+    EEFS_NandPage0_t            P;
+    uint32                      Erased = 0;
+    uint32                      b;
+    uint32                      i;
+    boolean                     Listed;
+
+    if (Vol->PendingCleanupBase > 0) {
+        EEFS_NandRunPendingCleanup(Vol);
+    }
+    for (b = Geo->DirRegionBlocks; b < Geo->BlockCount; b++) {
+        if ((Vol->Working.Map[b] != EEFS_NAND_MAP_FREE) || (Vol->Base.Map[b] != EEFS_NAND_MAP_FREE)) {
+            continue;
+        }
+        Listed = FALSE;
+        for (i = 0; i < Vol->PendingCleanupCount; i++) {
+            if (Vol->PendingCleanup[i] == b) Listed = TRUE;
+        }
+        if ((Listed == TRUE) || (EEFS_NandReadPage0(Vol, b, &P, NULL) != EEFS_SUCCESS)) {
+            continue;
+        }
+        if (EEFS_NandEraseBlock(Vol, b) == EEFS_SUCCESS) {
+            Erased++;
+        }
+        else {
+            EEFS_NandMarkBad(Vol, b);
+        }
+    }
+    if (Erased > 0) {
+        EEFS_NandTouch(Vol);
+    }
+    return((int32)Erased);
+
+} /* End of EEFS_NandReclaimOrphans() */
 
 /*
  * Local Functions

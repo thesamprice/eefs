@@ -4,12 +4,26 @@
 # QEMU when EEFS_RTEMS_QEMU_COMMAND is set.
 
 if(EEFS_BACKEND STREQUAL "nand")
-    # NAND backend: the RAM NAND simulator of the host tests is the device
+    # NAND backend: the RAM NAND simulator of the host tests is the device.  The test runs the health check in a
+    # low-priority task while a higher-priority task writes, so it links its own copy of the library built with
+    # EEFS_LIB_LOCK_HOOKS (EEFS_LIB_LOCK/UNLOCK call the test's RTEMS mutex); the eefs target keeps the empty
+    # default lock of the standalone driver.
+    set(_eefs_rtems_locked_sources ${EEFS_NAND_LIB_SOURCES} drivers/standalone_driver/eefs_filesys.c)
+    list(TRANSFORM _eefs_rtems_locked_sources PREPEND ${PROJECT_SOURCE_DIR}/)
+    add_library(eefs_rtems_locked STATIC ${_eefs_rtems_locked_sources})
+    target_link_libraries(eefs_rtems_locked PUBLIC eefs_headers)
+    target_compile_definitions(eefs_rtems_locked PUBLIC EEFS_LIB_LOCK_HOOKS)
+    target_include_directories(eefs_rtems_locked PUBLIC
+        ${EEFS_MACROS_DIR}
+        ${PROJECT_SOURCE_DIR}/drivers/standalone_driver)
+    target_compile_options(eefs_rtems_locked PRIVATE ${EEFS_WARNING_FLAGS})
+    set_target_properties(eefs_rtems_locked PROPERTIES C_STANDARD 90 C_EXTENSIONS OFF)
+
     add_executable(eefs_rtems_test.exe
         eefs_rtems_nand_test.c
         ${PROJECT_SOURCE_DIR}/tests/nand/nand_sim.c)
     target_include_directories(eefs_rtems_test.exe PRIVATE ${PROJECT_SOURCE_DIR}/tests/nand)
-    target_link_libraries(eefs_rtems_test.exe PRIVATE eefs microeefs)
+    target_link_libraries(eefs_rtems_test.exe PRIVATE eefs_rtems_locked microeefs)
     target_compile_options(eefs_rtems_test.exe PRIVATE ${EEFS_WARNING_FLAGS})
     set_target_properties(eefs_rtems_test.exe PROPERTIES C_STANDARD 11)
 else()

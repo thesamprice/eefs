@@ -149,6 +149,9 @@ uint32          EEFS_NandBlocksNeeded(EEFS_InodeTable_t *Vol, uint32 Size);
 boolean         EEFS_NandBlockUnchanged(EEFS_InodeTable_t *Vol, uint16 OldBlock, uint32 K, uint32 OldCrc, uint32 OldLen,
                                         const uint8 *NewSlice, uint32 NewLen);
 int32           EEFS_NandValidateSlot(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot, boolean Full);
+/* The flags of a failed validation: SLOTFLAG_CORRUPT and, for the active copy of an A/B entry, ActiveFailed in Working
+ * (and in Base when Base holds the same slot record) with ForceDirty; Touch when anything changed */
+void            EEFS_NandSlotFailed(EEFS_InodeTable_t *Vol, uint32 Entry, uint8 Slot);
 int32           EEFS_NandWriteCopy(EEFS_InodeTable_t *Vol, uint32 SrcEntry, uint8 SrcSlot, EEFS_NandPage0_t *NewP0, uint16 *DstBlocks);
 void            EEFS_NandTouch(EEFS_InodeTable_t *Vol);
 

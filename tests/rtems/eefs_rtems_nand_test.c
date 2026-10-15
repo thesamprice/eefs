@@ -7,8 +7,11 @@
  * must survive.  Then the file operations: files written through the driver, committed by the unmount, read back
  * after a remount, rewritten copy-on-write and renamed, and every committed file loaded byte for byte by the
  * bootloader library (microeefs_nand).  Phase 5: an A/B upload, activation and compatible fallback through the driver,
- * checked against the bootloader library.  Phase 8 replaces it with the full test.
- * Prints "EEFS RTEMS TEST PASSED" or "EEFS RTEMS TEST FAILED" and exits.
+ * checked against the bootloader library.  Phase 6: the health check runs the way it is meant to be deployed, in a
+ * low-priority task that takes small steps and sleeps between them, while a higher-priority task writes and commits
+ * files; the library lock (EEFS_LIB_LOCK, routed to an RTEMS mutex by EEFS_LIB_LOCK_HOOKS) is held only inside each
+ * step, every change restarts the check, and it finishes with the expected report.  Phase 8 replaces it with the full
+ * test.  Prints "EEFS RTEMS TEST PASSED" or "EEFS RTEMS TEST FAILED" and exits.
  */
 
 #include <rtems.h>
@@ -328,9 +331,266 @@ static void check_nand_ab(void)
     NandSim_Destroy(Sim);
 }
 
+/*
+ * Phase 6: the background health check
+ */
+
+#define BG_WRITES       3
+#define BG_STEP_READS   4
+#define BG_TRIGGER_READS 150
+
+static rtems_id                 LockId;             /* the library lock (a recursive, priority-inheriting mutex) */
+static rtems_id                 DoneSem;
+static rtems_id                 WriterGo;
+static rtems_id                 HealthId;
+static volatile uint32          HealthReads;        /* page reads made by the health task */
+static volatile uint32          Triggers;
+static volatile uint32          WaitsBefore[BG_WRITES];
+static volatile uint32          WaitsAfterWrite[BG_WRITES];
+static volatile uint32          LockContended;      /* times a task had to wait for the library lock */
+static volatile uint32          WriterCommits;
+static volatile uint32          HealthSteps;
+static volatile uint32          WriterDoneAtHealthEnd;
+static volatile int32           HealthRc;
+static EEFS_HealthReport_t      HealthRep;          /* the caller's report: static, about 3.5 KB */
+static EEFS_HealthSummary_t     HealthSum;
+
+/* EEFS_LIB_LOCK / EEFS_LIB_UNLOCK of the library built with EEFS_LIB_LOCK_HOOKS */
+void EEFS_LibLockHook(void)
+{
+    if (LockId == 0) return;
+    if (rtems_semaphore_obtain(LockId, RTEMS_NO_WAIT, 0) == RTEMS_UNSATISFIED) {
+        LockContended++;
+        (void)rtems_semaphore_obtain(LockId, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+    }
+}
+
+void EEFS_LibUnlockHook(void)
+{
+    if (LockId == 0) return;
+    (void)rtems_semaphore_release(LockId);
+}
+
+/* The device seen by the library: the simulator, except that a page read made by the health task releases the
+ * writer every BG_TRIGGER_READS reads (BG_WRITES times).  The writer has the higher priority, so it runs at once,
+ * inside the health check's step, while the health task holds the library lock: its write must wait for the lock
+ * (priority inheritance lets the step finish), and the check restarts at its next step. */
+static int32 HookRead(void *Ctx, uint32 Block, uint32 Page, void *Data, void *Oob)
+{
+    rtems_id    Self;
+
+    if ((HealthId != 0) && (rtems_task_ident(RTEMS_WHO_AM_I, RTEMS_SEARCH_LOCAL_NODE, &Self) == RTEMS_SUCCESSFUL) &&
+        (Self == HealthId) && (Triggers < BG_WRITES) && ((++HealthReads % BG_TRIGGER_READS) == 0)) {
+        Triggers++;
+        (void)rtems_semaphore_release(WriterGo);
+    }
+    return(NandSim_Ops()->ReadPage(Ctx, Block, Page, Data, Oob));
+}
+
+static int32 HookProgram(void *Ctx, uint32 Block, uint32 Page, const void *Data, const void *Oob)
+{
+    return(NandSim_Ops()->ProgramPage(Ctx, Block, Page, Data, Oob));
+}
+
+static int32 HookErase(void *Ctx, uint32 Block)
+{
+    return(NandSim_Ops()->EraseBlock(Ctx, Block));
+}
+
+static const EEFS_NandOps_t HookOps = { HookRead, HookProgram, HookErase };
+
+/* Low priority: start the check and take small steps until it is done, sleeping one tick between steps */
+static rtems_task HealthTask(rtems_task_argument Arg)
+{
+    int32   Status;
+
+    (void)Arg;
+    Status = EEFS_HealthCheckStart("/NAND0", &HealthRep);
+    CHECK(Status == EEFS_SUCCESS);
+    if (Status == EEFS_SUCCESS) {
+        do {
+            Status = EEFS_HealthCheckStep("/NAND0", BG_STEP_READS);
+            HealthSteps++;
+            (void)rtems_task_wake_after(1);
+        } while (Status == 1);
+    }
+    HealthRc = Status;
+    WriterDoneAtHealthEnd = (WriterCommits == BG_WRITES);
+    (void)rtems_semaphore_release(DoneSem);
+    rtems_task_exit();
+}
+
+/* High priority: whenever released (from inside a step of the check), write a file and commit */
+static rtems_task WriterTask(rtems_task_argument Arg)
+{
+    static char             Path[32];
+    EEFS_NandFileInfo_t     Meta;
+    uint32                  i;
+
+    (void)Arg;
+    memset(&Meta, 0, sizeof(Meta));
+    Meta.FileType = EEFS_FILE_TYPE_OTHER;
+    Meta.Slot = EEFS_NAND_SLOT_NONE;
+    Meta.Version = 1;
+    for (i = 0; i < BG_WRITES; i++) {
+        (void)rtems_semaphore_obtain(WriterGo, RTEMS_WAIT, RTEMS_NO_TIMEOUT);
+        WaitsBefore[i] = LockContended;
+        sprintf(Path, "/NAND0/bg/file%lu", (unsigned long)i);
+        CHECK(EEFS_WriteFile(Path, &Meta, Image2, 200000 + (i * 4096)) == EEFS_SUCCESS);
+        WaitsAfterWrite[i] = LockContended;
+        CHECK(EEFS_Commit("/NAND0") == EEFS_SUCCESS);
+        WriterCommits++;
+    }
+    (void)rtems_semaphore_release(DoneSem);
+    rtems_task_exit();
+}
+
+static void check_nand_health_background(void)
+{
+    EEFS_NandGeometry_t     Geo;
+    static EEFS_NandDevice_t Dev;   /* not on the stack: its address must differ from the other devices' */
+    EEFS_NandFileInfo_t     Meta;
+    EEFS_NandFileInfo_t     FInfo;
+    EEFS_NandVolumeInfo_t   VInfo;
+    EEFS_HealthReport_t    *Other = &HealthRep;
+    NandSim_t              *Sim;
+    rtems_id                Health;
+    rtems_id                Writer;
+    rtems_status_code       Sc;
+    uint32                  i;
+    uint32                  Bad = 0;
+
+    memset(&Geo, 0, sizeof(Geo));
+    Geo.PageSize = 4096;
+    Geo.OobSize = 224;
+    Geo.PagesPerBlock = 128;
+    Geo.BlockCount = 256;
+    Geo.DirRegionBlocks = 16;
+    Geo.BadMarkerPages = EEFS_NAND_BADMARKER_PAGE0;
+    Sim = NandSim_Create(&Geo);
+    CHECK(Sim != NULL);
+    if (Sim == NULL) return;
+    NandSim_FillDevice(Sim, &Dev);
+    Dev.Ops = &HookOps;
+    make_image(Image, 300000, 21);
+    make_image(Image2, 300000, 22);
+
+    /* a volume with a boot image, a library and an A/B application whose inactive copy B has decayed */
+    CHECK(EEFS_Format("/NANDDEV0", (cpuaddr)&Dev) == EEFS_SUCCESS);
+    CHECK(EEFS_Mount("/NANDDEV0", "/NAND0") == EEFS_SUCCESS);
+    memset(&Meta, 0, sizeof(Meta));
+    Meta.FileType = EEFS_FILE_TYPE_BOOT_FIT;
+    Meta.Slot = EEFS_NAND_SLOT_NONE;
+    Meta.Version = 3;
+    CHECK(EEFS_WriteFile("/NAND0/boot/image.fit", &Meta, Image, 300000) == EEFS_SUCCESS);
+    Meta.FileType = EEFS_FILE_TYPE_CFS_LIB;
+    CHECK(EEFS_WriteFile("/NAND0/cf/lib.so", &Meta, Image2, 70000) == EEFS_SUCCESS);
+    Meta.FileType = EEFS_FILE_TYPE_CFS_APP;
+    Meta.Slot = EEFS_NAND_SLOT_A;
+    CHECK(EEFS_WriteFile("/NAND0/cf/app.so", &Meta, Image, 150000) == EEFS_SUCCESS);
+    Meta.Slot = EEFS_NAND_SLOT_B;
+    CHECK(EEFS_WriteFile("/NAND0/cf/app.so", &Meta, Image, 150000) == EEFS_SUCCESS);
+    CHECK(EEFS_SetFallbackCompatible("/NAND0/cf/app.so", 1) == EEFS_SUCCESS);
+    CHECK(EEFS_Commit("/NAND0") == EEFS_SUCCESS);
+    CHECK(EEFS_GetFileInfo("/NAND0/cf/app.so", &FInfo) == EEFS_SUCCESS);
+    CHECK(FInfo.IsAB == 1 && FInfo.ActiveSlot == EEFS_NAND_SLOT_A);
+    NandSim_CorruptBytes(Sim, FInfo.SlotInfo[1].FirstBlock, 5, 100, 1);   /* B, data page 5 */
+
+    /* the API: no report yet, one check at a time, cancel */
+    CHECK(EEFS_HealthCheckSummary("/NAND0", &HealthSum) == EEFS_ERROR);
+    CHECK(EEFS_HealthCheckStart("/NAND0", &HealthRep) == EEFS_SUCCESS);
+    CHECK(EEFS_HealthCheckStart("/NAND0", Other) == EEFS_DEVICE_IS_BUSY);
+    CHECK(EEFS_HealthCheckStep("/NAND0", 1) == 1);
+    CHECK(EEFS_HealthCheckCancel("/NAND0") == EEFS_SUCCESS);
+    CHECK(EEFS_HealthCheckStep("/NAND0", 1) == EEFS_INVALID_ARGUMENT);
+
+    /* the check in a low-priority task, the writes in a high-priority one */
+    Sc = rtems_semaphore_create(rtems_build_name('B', 'G', 'D', 'N'), 0, RTEMS_COUNTING_SEMAPHORE | RTEMS_PRIORITY,
+                                0, &DoneSem);
+    CHECK(Sc == RTEMS_SUCCESSFUL);
+    Sc = rtems_semaphore_create(rtems_build_name('B', 'G', 'G', 'O'), 0, RTEMS_COUNTING_SEMAPHORE | RTEMS_PRIORITY,
+                                0, &WriterGo);
+    CHECK(Sc == RTEMS_SUCCESSFUL);
+    Sc = rtems_task_create(rtems_build_name('H', 'L', 'T', 'H'), 200, 32 * 1024, RTEMS_DEFAULT_MODES,
+                           RTEMS_DEFAULT_ATTRIBUTES, &Health);
+    CHECK(Sc == RTEMS_SUCCESSFUL);
+    HealthId = Health;
+    Sc = rtems_task_create(rtems_build_name('W', 'R', 'T', 'R'), 50, 32 * 1024, RTEMS_DEFAULT_MODES,
+                           RTEMS_DEFAULT_ATTRIBUTES, &Writer);
+    CHECK(Sc == RTEMS_SUCCESSFUL);
+    CHECK(rtems_task_start(Health, HealthTask, 0) == RTEMS_SUCCESSFUL);
+    CHECK(rtems_task_start(Writer, WriterTask, 0) == RTEMS_SUCCESSFUL);
+    CHECK(rtems_semaphore_obtain(DoneSem, RTEMS_WAIT, 30000) == RTEMS_SUCCESSFUL);
+    CHECK(rtems_semaphore_obtain(DoneSem, RTEMS_WAIT, 30000) == RTEMS_SUCCESSFUL);
+
+    /* the expected report: the check restarted for the writes, then went through the final state */
+    CHECK(HealthRc == EEFS_SUCCESS);
+    CHECK(WriterCommits == BG_WRITES);
+    CHECK(WriterDoneAtHealthEnd == 1);
+    CHECK(EEFS_HealthCheckSummary("/NAND0", &HealthSum) == EEFS_SUCCESS);
+    CHECK(memcmp(&HealthSum, &HealthRep.S, sizeof(HealthSum)) == 0);
+    CHECK(EEFS_GetVolumeInfo("/NAND0", &VInfo) == EEFS_SUCCESS);
+    printf("health check in the background: %lu steps, %lu restarts, %lu pages read, lock waits %lu, summary 0x%lx\n",
+           (unsigned long)HealthSum.Steps, (unsigned long)HealthSum.Restarts, (unsigned long)HealthSum.PagesRead,
+           (unsigned long)LockContended, (unsigned long)HealthSum.Summary);
+    CHECK(HealthSum.Complete == 1);
+    CHECK(Triggers == BG_WRITES);
+    CHECK(LockContended == BG_WRITES);          /* each write waited once, for the step it interrupted */
+    for (i = 0; i < BG_WRITES; i++) {
+        CHECK(WaitsAfterWrite[i] == WaitsBefore[i] + 1);
+    }
+    CHECK(HealthSum.Restarts == BG_WRITES);     /* each write + commit restarted the check once */
+    CHECK(HealthSum.Steps == HealthSteps);
+    CHECK(HealthSum.DirSeq == VInfo.LastSeq);
+    CHECK(HealthSum.FilesChecked == 3 + BG_WRITES);
+    CHECK(HealthSum.SlotsChecked == 4 + BG_WRITES);
+    CHECK(HealthSum.Summary == (EEFS_HEALTH_DEGRADED | EEFS_HEALTH_AB_ISSUE | EEFS_HEALTH_FILE_ISSUE));
+    CHECK(HealthSum.FindingCount == 2);
+    for (i = 0; i < HealthSum.FindingCount; i++) {
+        if (HealthSum.Finding[i].Code == EEFS_HEALTH_FILE_CORRUPT) {
+            CHECK(HealthSum.Finding[i].Slot == EEFS_NAND_SLOT_B && HealthSum.Finding[i].Aux0 == 1);
+            CHECK(HealthSum.Finding[i].Block == FInfo.SlotInfo[1].FirstBlock);
+        }
+        else if (HealthSum.Finding[i].Code == EEFS_HEALTH_AB_B_CORRUPT) {
+            CHECK(strcmp(HealthSum.Finding[i].Path, "/cf/app.so") == 0);
+        }
+        else {
+            Bad++;
+        }
+    }
+    CHECK(Bad == 0);
+    CHECK(EEFS_GetFileInfo("/NAND0/cf/app.so", &FInfo) == EEFS_SUCCESS);
+    CHECK(FInfo.ActiveFailed == 0);             /* the inactive copy is bad; the active one is fine */
+    CHECK(FInfo.SlotInfo[1].Corrupt == 1);
+
+    /* repair B from A; the next check is clean; nothing to reclaim */
+    CHECK(EEFS_CopySlot("/NAND0/cf/app.so", EEFS_NAND_SLOT_A, EEFS_NAND_SLOT_B) == EEFS_SUCCESS);
+    CHECK(EEFS_Commit("/NAND0") == EEFS_SUCCESS);
+    CHECK(EEFS_HealthCheckStart("/NAND0", &HealthRep) == EEFS_SUCCESS);
+    while (EEFS_HealthCheckStep("/NAND0", 64) == 1) {
+    }
+    CHECK(EEFS_HealthCheckSummary("/NAND0", &HealthSum) == EEFS_SUCCESS);
+    CHECK(HealthSum.Summary == EEFS_HEALTH_OK && HealthSum.FindingCount == 0 && HealthSum.Restarts == 0);
+    CHECK(EEFS_ReclaimOrphans("/NAND0") == 0);
+    CHECK(EEFS_UnMount("/NAND0") == EEFS_SUCCESS);
+    CHECK(NandSim_Violations(Sim) == 0);
+    NandSim_Destroy(Sim);
+}
+
 static rtems_task Init(rtems_task_argument ignored)
 {
+    rtems_status_code   Sc;
+
     (void)ignored;
+
+    /* the library lock first: every EEFS_Lib call takes it */
+    Sc = rtems_semaphore_create(rtems_build_name('E', 'E', 'F', 'S'), 1,
+                                RTEMS_BINARY_SEMAPHORE | RTEMS_PRIORITY | RTEMS_INHERIT_PRIORITY, 0, &LockId);
+    if (Sc != RTEMS_SUCCESSFUL) {
+        printf("FAIL: library lock not created\n");
+        LockId = 0;
+        Failures++;
+    }
 
     printf("\nEEFS %d.%d.%d RTEMS NAND test\n", EEFS_MAJOR_VERSION, EEFS_MINOR_VERSION, EEFS_REVISION);
 
@@ -339,6 +599,7 @@ static rtems_task Init(rtems_task_argument ignored)
     check_nand_format();
     check_nand_files();
     check_nand_ab();
+    check_nand_health_background();
 
     printf(Failures == 0 ? "EEFS RTEMS TEST PASSED\n" : "EEFS RTEMS TEST FAILED (%d)\n", Failures);
     exit(Failures == 0 ? 0 : 1);
@@ -346,10 +607,12 @@ static rtems_task Init(rtems_task_argument ignored)
 
 #define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
 #define CONFIGURE_APPLICATION_NEEDS_CONSOLE_DRIVER
-#define CONFIGURE_MAXIMUM_TASKS            1
+#define CONFIGURE_MAXIMUM_TASKS            3
+#define CONFIGURE_MAXIMUM_SEMAPHORES       3
+#define CONFIGURE_MICROSECONDS_PER_TICK    1000
 #define CONFIGURE_RTEMS_INIT_TASKS_TABLE
 #define CONFIGURE_INIT_TASK_ATTRIBUTES     RTEMS_FLOATING_POINT
 #define CONFIGURE_INIT_TASK_STACK_SIZE     (32 * 1024)
-#define CONFIGURE_EXTRA_TASK_STACKS        (32 * 1024)
+#define CONFIGURE_EXTRA_TASK_STACKS        (2 * 32 * 1024)
 #define CONFIGURE_INIT
 #include <rtems/confdefs.h>

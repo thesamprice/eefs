@@ -34,9 +34,19 @@
 #define EEFS_LIB_EEPROM_FLUSH
 
 /* These macros define the lock and unlock interface functions used to guarentee
- * exclusive access to shared resources.  Defaults to undefined since it is implementation dependent */
+ * exclusive access to shared resources.  Defaults to undefined since it is implementation dependent.
+ * With EEFS_LIB_LOCK_HOOKS defined they call EEFS_LibLockHook() and EEFS_LibUnlockHook(), which the application
+ * provides (one recursive mutex for the whole library; the NAND backend needs it when several tasks use the
+ * library, e.g. a background health check, see docs/nand-implementation.md section 13). */
+#ifdef EEFS_LIB_LOCK_HOOKS
+extern void EEFS_LibLockHook(void);
+extern void EEFS_LibUnlockHook(void);
+#define EEFS_LIB_LOCK                           EEFS_LibLockHook()
+#define EEFS_LIB_UNLOCK                         EEFS_LibUnlockHook()
+#else
 #define EEFS_LIB_LOCK
 #define EEFS_LIB_UNLOCK
+#endif
 
 /* This macro defines the time interface function.  Defaults to time(NULL) */
 #define EEFS_LIB_TIME                           time(NULL)

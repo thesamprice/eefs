@@ -18,7 +18,8 @@
  *   Every HAL call of the library goes through these wrappers.  ReadPage status codes map to EEFS_SUCCESS (corrected
  *   bits reported) or EEFS_IO_ERROR; a failed program, erase or read-back verify is EEFS_IO_ERROR and the caller
  *   decides whether to mark the block bad.  The one-page read cache (CacheBuf) is invalidated by every program and
- *   erase.  EEFS_NandMarkBad also takes a directory block out of its mirror ring.
+ *   erase, and every program and erase bumps VolumeChangeCounter, so a health check running in steps restarts after any
+ *   media change, whichever call made it.  EEFS_NandMarkBad also takes a directory block out of its mirror ring.
  *
  */
 
@@ -100,6 +101,7 @@ int32 EEFS_NandProgramPage(EEFS_InodeTable_t *Vol, uint32 Block, uint32 Page, co
 int32 EEFS_NandProgramPageVerified(EEFS_InodeTable_t *Vol, uint32 Block, uint32 Page, const uint8 *Data, uint8 *Scratch)
 {
     EEFS_NandInvalidateCache(Vol);
+    Vol->VolumeChangeCounter++;         /* the media changed: a running health check restarts */
     if (Vol->Dev->Ops->ProgramPage(Vol->Dev->Ctx, Block, Page, Data, NULL) != 0) {
         return(EEFS_IO_ERROR);
     }
@@ -124,6 +126,7 @@ int32 EEFS_NandProgramPageVerified(EEFS_InodeTable_t *Vol, uint32 Block, uint32 
 int32 EEFS_NandEraseBlock(EEFS_InodeTable_t *Vol, uint32 Block)
 {
     EEFS_NandInvalidateCache(Vol);
+    Vol->VolumeChangeCounter++;         /* the media changed: a running health check restarts */
     if (Vol->Dev->Ops->EraseBlock(Vol->Dev->Ctx, Block) != 0) {
         return(EEFS_IO_ERROR);
     }
