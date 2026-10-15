@@ -35,7 +35,7 @@
  */
 
 /* Return a pointer to the File Header of the specified file in the specified EEFS or NULL if an error occurs. */
-void *MicroEEFS_FindFile(uint32 BaseAddress, char *Filename);
+void *MicroEEFS_FindFile(cpuaddr BaseAddress, char *Filename);
 
 #endif
 

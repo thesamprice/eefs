@@ -48,26 +48,37 @@ CRCs are not maintained by the library. Only the boot code checks the FAT CRC.
 
 ## Building
 
-Each tool has its own GNU Makefile, written for a 32-bit x86 Linux host circa 2011.
+Each tool has its own GNU Makefile. Both host tools build natively on 64-bit hosts, including
+this arm64 Mac (the original `-m32` requirement is gone).
 
 ```sh
-cd tools/geneepromfs && make            # builds ./geneepromfs
+cd tools/geneepromfs && make            # builds ./geneepromfs (-Werror)
 cd tools/eefstool && make eefstool-img  # default 'all' target is the BDM build
 ```
 
-Known problems on a modern 64-bit host (including this arm64 Mac):
+64-bit portability rules (keep them when editing):
 
-- **`-m32` is mandatory for correctness, not just style.** For `_ix86_`, `common_types.h`
-  typedefs `int32`/`uint32` as `long`, which is 8 bytes on LP64. Without `-m32` the build
-  produces images with 8-byte fields that targets can't read. (Verified: the magic lands at
-  offset 8 instead of 4.) macOS arm64 can't build `-m32` at all. Any real port must switch those
-  typedefs to `<stdint.h>` (`int32_t`/`uint32_t`) first, then drop `-m32`.
-- With `-Werror`, `geneepromfs.c:259/269` fail on `%d` with a `size_t`/`unsigned long` argument.
-- In `eefstool/Makefile`, `INCPATH` has a bad `-I../../inc:../../drivers/standalone_driver`
-  (a colon instead of a second `-I`). The BDM target also links `/opt/rtems-4.10/lib/libBDM.a`,
-  `-ltblcf` and `-lusb`, which aren't present here.
-- The Makefiles' `clean` targets don't remove the built binaries (`geneepromfs`). Don't commit
-  build outputs.
+- `common_types.h` defines `int8`…`uint64` from `<stdint.h>`. The arch blocks only set
+  endianness and `boolean`. Never reintroduce `long`-based typedefs: on LP64 they make on-media
+  fields 8 bytes and corrupt images.
+- Memory addresses use `cpuaddr` (`uintptr_t`): `InodeTable->BaseAddress` and the `BaseAddress`
+  parameters of `EEFS_LibInitFS`, `EEFS_InitFS`, `EEFS_DevCreate` and `MicroEEFS_FindFile`.
+  Pointer-to-offset math is done as `(uint32)((cpuaddr)ptr - BaseAddress)`.
+- On-media structs contain only fixed-width types. `EEFS_FileHeader_t` dates are `uint32`
+  (not `time_t`, which is 64-bit on modern hosts and on RTEMS 5+). `EEFS_Stat_t` keeps `time_t`.
+- `printf` of `uint32` values casts to `(unsigned long)` with `%lu`/`%lx`, and pointers use `%p`.
+- Regression check: an image from the 64-bit `geneepromfs` is byte-identical to one from the
+  original code built `-m32` in `i386/debian:bookworm` Docker (`-t` fixes the timestamp).
+
+Remaining known problems:
+
+- `libraries/page_window/` and the BDM driver still cast pointers to `uint32`. They only build
+  for their 32-bit targets. The BDM target also links `/opt/rtems-4.10/lib/libBDM.a`, `-ltblcf`
+  and `-lusb`, which aren't present here.
+- `eefstool-img --copy_to` adds a FAT slot that `--dir` doesn't list, and `--rename`/`--delete`
+  are no-ops. This is existing behavior: the original 32-bit build does exactly the same.
+  Reads (`--dir`, `--usage`, `--copy_from`) work.
+- The Makefiles' `clean` targets don't remove the built binaries. Don't commit build outputs.
 
 To cross-compile the library and drivers for a target, add `libraries/eepromfs/eefs_fileapi.c`
 plus the chosen driver to the target build, with `-I inc -I drivers/<driver>` and the right arch
@@ -76,8 +87,8 @@ define for `common_types.h`.
 ## Conventions
 
 - Keep the existing NASA style: the license banner at the top of each file, `/* */` comments
-  only (`-ansi`), `EEFS_` prefixes, the project's `int32`/`uint32` types, and return codes from
-  the `EEFS_*` error list in `eefs_fileapi.h`.
+  only (`-ansi`), `EEFS_` prefixes, the project's `int32`/`uint32`/`cpuaddr` types, and return
+  codes from the `EEFS_*` error list in `eefs_fileapi.h`.
 - On-media structs are big-endian by convention (geneepromfs default). Host tools must byte-swap
   through `eefs_swap.c`.
 - No test suite exists. To validate a change, build geneepromfs, generate an image from a small

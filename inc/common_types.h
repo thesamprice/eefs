@@ -71,14 +71,6 @@
   typedef unsigned char                         boolean;
 #endif
 
-  typedef signed char                           int8;
-  typedef short int                             int16;
-  typedef long int                              int32;
-  typedef unsigned char                         uint8;
-  typedef unsigned short int                    uint16;
-  typedef unsigned long int                     uint32;
-  _EXTENSION_ typedef unsigned long long int    uint64;
-
 #elif defined(__PPC__)
    /* ----------------------- Motorola Power PC family ---------------------------*/
    /* The PPC can be programmed to be big or little endian, we assume native */
@@ -87,13 +79,6 @@
    #undef  _STRUCT_LOW_BIT_FIRST_
 
    typedef unsigned char                        boolean;
-   typedef signed char                          int8;
-   typedef short int                            int16;
-   typedef long int                             int32;
-   typedef unsigned char                        uint8;
-   typedef unsigned short int                   uint16;
-   typedef unsigned long int                    uint32;
-   _EXTENSION_ typedef unsigned long long int   uint64;
 
 #elif defined(_m68k_)
    /* ----------------------- Motorola m68k/Coldfire family ---------------------------*/
@@ -102,13 +87,6 @@
    #undef  _STRUCT_LOW_BIT_FIRST_
 
    typedef unsigned char                        boolean;
-   typedef signed char                          int8;
-   typedef short int                            int16;
-   typedef long int                             int32;
-   typedef unsigned char                        uint8;
-   typedef unsigned short int                   uint16;
-   typedef unsigned long int                    uint32;
-   _EXTENSION_ typedef unsigned long long int   uint64;
 
 #elif defined(__SPARC__)
    /* ----------------------- SPARC/LEON family ---------------------------*/
@@ -117,17 +95,28 @@
    #undef  _STRUCT_LOW_BIT_FIRST_
 
    typedef unsigned char                        boolean;
-   typedef signed char                          int8;
-   typedef short int                            int16;
-   typedef long int                             int32;
-   typedef unsigned char                        uint8;
-   typedef unsigned short int                   uint16;
-   typedef unsigned long int                    uint32;
-   _EXTENSION_ typedef unsigned long long int   uint64;
 
 #else  /* not any of the above */
    #error undefined processor
 #endif  /* processor types */
+
+/*
+** Fixed-width integer types.  These are used for on-media structures, so they
+** must be exactly the named width on every host and target (an LP64 host would
+** otherwise make "long" 8 bytes and corrupt the image layout).
+*/
+#include <stdint.h>
+
+typedef int8_t                                  int8;
+typedef int16_t                                 int16;
+typedef int32_t                                 int32;
+typedef uint8_t                                 uint8;
+typedef uint16_t                                uint16;
+typedef uint32_t                                uint32;
+typedef uint64_t                                uint64;
+
+/* Integer type wide enough to hold a pointer (memory addresses) */
+typedef uintptr_t                               cpuaddr;
 
 #ifndef NULL              /* pointer to nothing */
    #define NULL ((void *) 0)

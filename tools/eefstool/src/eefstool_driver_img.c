@@ -152,7 +152,7 @@ void eefstool_open_device (void)
     {
        printf("Read the file into the temporary buffer\n");
     }
-    CommandLineOptions.EEFSMemoryAddress = eefsImageDataPtr;
+    CommandLineOptions.EEFSMemoryAddress = (cpuaddr)eefsImageDataPtr;
     CommandLineOptions.EEFSMemoryAddressEntered = FALSE;
 
     return;

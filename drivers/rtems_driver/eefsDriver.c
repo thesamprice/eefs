@@ -198,7 +198,7 @@ int rtems_eefs_initialize ( rtems_filesystem_mount_table_entry_t *mt_entry,
       #ifdef EEFS_DEBUG
          printf("Mounting EEFS Bank 1 at: 0x%08X\n", (unsigned int )rtems_eefs_a_address);
       #endif
-      Status =  EEFS_LibInitFS( &(fs->eefs_inode_table),  (uint32)rtems_eefs_a_address );
+      Status =  EEFS_LibInitFS( &(fs->eefs_inode_table),  (cpuaddr)rtems_eefs_a_address );
    }
    else 
    {

@@ -117,7 +117,7 @@ int EEFS_DrvInstall(void)
 /* Add a eeprom file system device to the vxWorks device list. The device name must start with a slash, ex. /eefs1.  The
  * base address is the start address of the file system in eeprom.  The device descriptor is initialized by this function 
  * however you must allocate memory for the device descriptor.  Returns OK on success or ERROR if there was an error. */
-int EEFS_DevCreate(int DriverNumber, char *DeviceName, uint32 BaseAddress, EEFS_DeviceDescriptor_t *DeviceDescriptor)
+int EEFS_DevCreate(int DriverNumber, char *DeviceName, cpuaddr BaseAddress, EEFS_DeviceDescriptor_t *DeviceDescriptor)
 {
     int ReturnCode;
 

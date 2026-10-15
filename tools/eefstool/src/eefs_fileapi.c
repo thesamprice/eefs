@@ -79,7 +79,7 @@ void EEFS_LibInit(void)
 } /* End of EEFS_LibInit() */
 
 /* Initializes the Inode Table.  Returns EEFS_SUCCESS on success, EEFS_NO_SUCH_DEVICE or EEFS_INVALID_ARGUMENT on error. */
-int32 EEFS_LibInitFS(EEFS_InodeTable_t *InodeTable, uint32 BaseAddress)
+int32 EEFS_LibInitFS(EEFS_InodeTable_t *InodeTable, cpuaddr BaseAddress)
 {
     EEFS_FileAllocationTable_t         *FileAllocationTable;
     EEFS_FileAllocationTableHeader_t    FileAllocationTableHeader;
@@ -351,7 +351,7 @@ int32 EEFS_LibCreatFile(EEFS_InodeTable_t *InodeTable, char *Filename, uint32 At
                             FileHeader.InUse = TRUE;
                             FileHeader.Attributes = Attributes;
                             FileHeader.FileSize = 0;
-                            FileHeader.ModificationDate = EEFS_LIB_TIME;
+                            FileHeader.ModificationDate = (uint32)EEFS_LIB_TIME;
                             FileHeader.CreationDate = FileHeader.ModificationDate;
                             strncpy(FileHeader.Filename, Filename, EEFS_MAX_FILENAME_SIZE);
                             EEFS_LIB_EEPROM_WRITE(InodeTable->File[InodeIndex].FileHeaderPointer, &FileHeader, sizeof(EEFS_FileHeader_t));
@@ -445,7 +445,7 @@ int32 EEFS_LibClose(int32 FileDescriptor)
             /* Add the new entry to the File Allocation Table */
             FileAllocationTable = (void *)InodeTable->BaseAddress;
 
-            FileAllocationTableEntry.FileHeaderOffset = (uint32)(InodeTable->File[InodeIndex].FileHeaderPointer - InodeTable->BaseAddress);
+            FileAllocationTableEntry.FileHeaderOffset = (uint32)((cpuaddr)InodeTable->File[InodeIndex].FileHeaderPointer - InodeTable->BaseAddress);
             FileAllocationTableEntry.MaxFileSize = InodeTable->File[InodeIndex].MaxFileSize;
             EEFS_SwapFileAllocationTableEntry(&FileAllocationTableEntry); /* APC */
             EEFS_LIB_EEPROM_WRITE(&FileAllocationTable->File[InodeIndex], &FileAllocationTableEntry, sizeof(EEFS_FileAllocationTableEntry_t));
@@ -455,7 +455,7 @@ int32 EEFS_LibClose(int32 FileDescriptor)
                reset occurs the new file will not exist in the file system until the following lines of code are executed. */
             EEFS_LIB_EEPROM_READ(&FileAllocationTableHeader, &FileAllocationTable->Header, sizeof(EEFS_FileAllocationTableHeader_t));
             EEFS_SwapFileAllocationTableHeader(&FileAllocationTableHeader);/*APC */
-            FileAllocationTableHeader.FreeMemoryOffset = (uint32)(InodeTable->FreeMemoryPointer - InodeTable->BaseAddress);
+            FileAllocationTableHeader.FreeMemoryOffset = (uint32)((cpuaddr)InodeTable->FreeMemoryPointer - InodeTable->BaseAddress);
             FileAllocationTableHeader.FreeMemorySize = InodeTable->FreeMemorySize;
             FileAllocationTableHeader.NumberOfFiles = InodeTable->NumberOfFiles;
             EEFS_SwapFileAllocationTableHeader(&FileAllocationTableHeader);/*APC */
@@ -468,7 +468,7 @@ int32 EEFS_LibClose(int32 FileDescriptor)
             EEFS_LIB_EEPROM_READ(&FileHeader, EEFS_FileDescriptorTable[FileDescriptor].FileHeaderPointer, sizeof(EEFS_FileHeader_t));
             EEFS_SwapFileHeader(&FileHeader); /* APC */
             FileHeader.FileSize = EEFS_FileDescriptorTable[FileDescriptor].FileSize;
-            FileHeader.ModificationDate = EEFS_LIB_TIME;
+            FileHeader.ModificationDate = (uint32)EEFS_LIB_TIME;
             FileHeader.Crc = 0;   /* Automatically updating the CRC is not supported at this time */
             EEFS_SwapFileHeader(&FileHeader); /* APC */
             EEFS_LIB_EEPROM_WRITE(EEFS_FileDescriptorTable[FileDescriptor].FileHeaderPointer, &FileHeader, sizeof(EEFS_FileHeader_t));
@@ -1161,25 +1161,25 @@ int32 EEFS_LibChkDsk(EEFS_InodeTable_t *InodeTable, uint32 Flags)
     (void)Flags;
 
     /* Dump the Inode Table and File Headers */
-    printf("Base Address:        %#lx\n", InodeTable->BaseAddress);
-    printf("Free Memory Pointer: %#lx\n", (uint32)InodeTable->FreeMemoryPointer);
-    printf("Free Memory Size:    %ld\n", InodeTable->FreeMemorySize);
-    printf("Number Of Files:     %ld\n", InodeTable->NumberOfFiles);
+    printf("Base Address:        %p\n", (void *)InodeTable->BaseAddress);
+    printf("Free Memory Pointer: %p\n", InodeTable->FreeMemoryPointer);
+    printf("Free Memory Size:    %lu\n", (unsigned long)InodeTable->FreeMemorySize);
+    printf("Number Of Files:     %lu\n", (unsigned long)InodeTable->NumberOfFiles);
 
     for (i=0; i < InodeTable->NumberOfFiles; i++) {
 
-        printf("[%ld] FileHeaderPointer    %#lx\n", i, (uint32)InodeTable->File[i].FileHeaderPointer);
-        printf("[%ld] Max File Size        %ld\n", i, InodeTable->File[i].MaxFileSize);
+        printf("[%lu] FileHeaderPointer    %p\n", (unsigned long)i, InodeTable->File[i].FileHeaderPointer);
+        printf("[%lu] Max File Size        %lu\n", (unsigned long)i, (unsigned long)InodeTable->File[i].MaxFileSize);
 
         EEFS_LIB_EEPROM_READ(&FileHeader, InodeTable->File[i].FileHeaderPointer, sizeof(EEFS_FileHeader_t));
         EEFS_SwapFileHeader(&FileHeader); /* APC */
-        printf("[%ld] Crc                  %#lx\n", i, FileHeader.Crc);
-        printf("[%ld] InUse                %ld\n", i, FileHeader.InUse);
-        printf("[%ld] Attributes           %#lx\n", i, FileHeader.Attributes);
-        printf("[%ld] FileSize             %ld\n", i, FileHeader.FileSize);
-        printf("[%ld] Modification Date    %ld\n", i, FileHeader.ModificationDate);
-        printf("[%ld] Creation Date        %ld\n", i, FileHeader.CreationDate);
-        printf("[%ld] Filename             %-40s\n", i, FileHeader.Filename);
+        printf("[%lu] Crc                  %#lx\n", (unsigned long)i, (unsigned long)FileHeader.Crc);
+        printf("[%lu] InUse                %lu\n", (unsigned long)i, (unsigned long)FileHeader.InUse);
+        printf("[%lu] Attributes           %#lx\n", (unsigned long)i, (unsigned long)FileHeader.Attributes);
+        printf("[%lu] FileSize             %lu\n", (unsigned long)i, (unsigned long)FileHeader.FileSize);
+        printf("[%lu] Modification Date    %lu\n", (unsigned long)i, (unsigned long)FileHeader.ModificationDate);
+        printf("[%lu] Creation Date        %lu\n", (unsigned long)i, (unsigned long)FileHeader.CreationDate);
+        printf("[%lu] Filename             %-40s\n", (unsigned long)i, FileHeader.Filename);
     }
     
     return(EEFS_SUCCESS);

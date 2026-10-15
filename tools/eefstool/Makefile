@@ -20,12 +20,12 @@
 
 VPATH =  ./src:../../libraries/eepromfs:../../drivers/standalone_driver
 
-INCPATH = -I./inc -I../../inc:../../drivers/standalone_driver
+INCPATH = -I./inc -I../../inc -I../../drivers/standalone_driver
 
 SYSINC = /opt/rtems-4.10/include
 LIBDIR = /opt/rtems-4.10/lib
 
-CFLAGS = -O -g -Wall -D_ix86_ -m32
+CFLAGS = -O -g -Wall -D_ix86_
 
 BDMPROG = eefstool-bdm
 IMGPROG = eefstool-img
