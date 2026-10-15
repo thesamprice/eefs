@@ -19,6 +19,25 @@
  *   Links only microeefs_nand.c, eefs_nand_format.c and eefs_crc32.c.  No globals except the slot hook pointer.
  *   Algorithms: docs/nand-format.md sections 7.2-7.4.
  *
+ *   Never writes NAND: the only HAL call is ReadPage.  The only page-sized buffer is the caller's PageBuffer
+ *   (Dev->Geometry.PageSize bytes).  Stack use is about 1.5 KB (arm-rtems7-gcc -O2): one EEFS_NandEntry_t, one
+ *   EEFS_NandPage0_t, an OOB array of EEFS_NAND_MAX_OOB_SIZE bytes and EEFS_NAND_MAX_DIR_BLOCKS / 2 directory
+ *   candidates.
+ *
+ *   Name is "path", "path@A" or "path@B" (the library's name rules, docs/nand-implementation.md 6.1).  Without a
+ *   suffix the slot is chosen by FMT 7.3: the directory's active slot (A for single-copy files), possibly overridden
+ *   by the slot hook, then the other slot if the first fails and the entry is FallbackCompatible.  With a suffix only
+ *   that copy is considered (EEFS_FILE_NOT_FOUND if it is not in use): the hook is not called and there is no
+ *   fallback.
+ *
+ *   Info on return: Info.Path is the path without suffix.  When a copy was validated (FindFile) or loaded (LoadFile),
+ *   LoadedSlot and Info.Slot name it and FileType, Version, FileSize, FileCrc32 and Type come from its metadata page;
+ *   otherwise LoadedSlot is EEFS_NAND_SLOT_NONE.  IsAB, ActiveSlot, FallbackCompatible, Attributes, CreationDate and
+ *   SlotInfo[] are the directory's (or the scan's) view.  ActiveFailed is the directory value, or 1 when the copy
+ *   tried first failed its check (an explicit "@A"/"@B" copy counts only when it is the active one); SlotInfo[s].Corrupt
+ *   is set for every copy that failed.  EEFS_NO_SPACE_LEFT_ON_DEVICE (MaxSize too small) is not a copy failure: it
+ *   neither sets ActiveFailed nor triggers the fallback.
+ *
  * References:
  *   docs/nand-implementation.md section 9.
  */
@@ -59,9 +78,9 @@ typedef struct
 /* Sets the BSP slot hook; NULL restores the default (returns DirectorySlot) */
 void    MicroEEFS_NandSetSlotHook(MicroEEFS_NandSlotHook_t Hook, void *HookCtx);
 
-/* Finds Name and validates the metadata page of the slot to load.  PageBuffer is Dev->Geometry.PageSize bytes.
- * EEFS_SUCCESS, EEFS_INVALID_ARGUMENT, EEFS_FILE_NOT_FOUND, EEFS_GEOMETRY_MISMATCH, EEFS_CORRUPT_FILE, EEFS_IO_ERROR,
- * EEFS_NOT_FORMATTED. */
+/* Finds Name and validates the metadata page of the slot to load (the fallback rule is applied at that level).
+ * PageBuffer is Dev->Geometry.PageSize bytes.  EEFS_SUCCESS, EEFS_INVALID_ARGUMENT, EEFS_FILE_NOT_FOUND,
+ * EEFS_GEOMETRY_MISMATCH, EEFS_CORRUPT_FILE, EEFS_IO_ERROR, EEFS_NOT_FORMATTED (no directory and no metadata page). */
 int32   MicroEEFS_NandFindFile(const EEFS_NandDevice_t *Dev, uint8 *PageBuffer, const char *Name, MicroEEFS_NandInfo_t *Info);
 
 /* Finds and loads Name into Dest (at most MaxSize bytes), checking every CRC.  Return codes as FindFile, plus

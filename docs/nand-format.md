@@ -527,6 +527,7 @@ Other      = 1 - TrySlot
 
 rc = LoadSlot(TrySlot)                          /* 7.4 */
 if rc == SUCCESS: LoadedSlot = TrySlot; ActiveFailed = entry.ActiveFailed; return SUCCESS
+if rc == NO_SPACE_LEFT_ON_DEVICE: return rc     /* destination too small: not a failed copy, no fallback */
 ActiveFailed = 1
 if Slot[Other].InUse && entry.FallbackCompatible:
     rc2 = LoadSlot(Other)
@@ -534,6 +535,9 @@ if Slot[Other].InUse && entry.FallbackCompatible:
     return rc2 with ActiveFailed = 1
 return rc with ActiveFailed = 1                 /* EEFS_CORRUPT_FILE or EEFS_IO_ERROR */
 ```
+
+A name with an explicit `@A` / `@B` suffix (the library's name rule) selects that copy only: it must be
+in use (else `EEFS_FILE_NOT_FOUND`), the hook is not called and there is no fallback.
 
 The hook exists for automatic rollback after a boot that crashed without a CRC failure (for
 example a boot counter in persistent RAM). The hook's choice is tried first, as the BSP's explicit
