@@ -450,7 +450,11 @@ Used only when neither mirror has a valid checkpoint.
    (`Path`, slot) where slot = `Slot` if A or B, else A.
 2. For each (`Path`, slot), the candidate with the highest `WriteSeq` wins; on a tie, the lower
    block number wins. Losers are orphans.
-3. Each winner claims the blocks in its `Blocks[]`. Group winners by `Path` into entries (at most
+3. **Overlap rule:** take the winners in descending `WriteSeq` order. A winner that lists a block
+   already claimed by a winner with a higher `WriteSeq` is discarded entirely (orphan). This
+   resolves the superseded page 0 left by a rename or attribute change (which rewrites only the
+   first block, so the old and new page 0 share `Blocks[1..]`) when its cleanup erase was cut.
+   Each remaining winner claims the blocks in its `Blocks[]`. Group winners by `Path` into entries (at most
    `EEFS_MAX_FILES`; further paths are ignored and remain orphans). For each entry:
    `IsAB` = 1 if any winner has `Slot` A or B explicitly; `ActiveSlot` = A if slot A is present,
    else B; `FallbackCompatible` = 0; `ActiveFailed` = 0; `Attributes`, `FileType`,

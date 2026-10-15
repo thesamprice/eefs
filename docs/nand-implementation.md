@@ -610,7 +610,7 @@ The existing `EEFS_Lib*` prototypes keep their signatures. NAND semantics:
 | `EEFS_LibRemove` | 6.5 |
 | `EEFS_LibRename` | 6.6 |
 | `EEFS_LibStat` / `EEFS_LibFstat` | from RAM entry (no NAND read): `InodeIndex`, `Crc` = `FileCrc32`, `Attributes`, `FileSize`, dates, `Filename` = path. For an A/B name without suffix: the active slot, no fallback. `EEFS_FILE_NOT_FOUND` |
-| `EEFS_LibSetFileAttributes` | 6.6 (copy) |
+| `EEFS_LibSetFileAttributes` | 6.6 (first-block rewrite) |
 | `EEFS_LibOpenDir/ReadDir/CloseDir` | iterates entries `0..EEFS_MAX_FILES-1` of `Working`; `Filename` = path, `InUse`, `InodeIndex`, `FileHeaderPointer = NULL`, `MaxFileSize` = active slot's `AllocBlocks * BlockBytes - PageSize` (0 if not in use) |
 | `EEFS_LibHasOpenFiles/HasOpenDir/FileDescriptor2Pointer/GetFileDescriptorsInUse/HighWaterMark/GetMaxFiles/GetMaxOpenFiles/PrintOpenFiles` | as EEPROM |
 | `EEFS_LibChkDsk(T, Flags)` | prints the Working directory (entries, slots, flags, map summary, mirror state) and runs `EEFS_LibVerifyFile` on every in-use slot; returns `EEFS_SUCCESS` or the first error |
@@ -1074,10 +1074,12 @@ A/B:  slot not in use -> FILE_NOT_FOUND; descriptor open on (i,s) -> PERMISSION_
 Touch; AUTO_COMMIT.
 ```
 
-### 6.6 Rename and SetFileAttributes (copy)
+### 6.6 Rename and SetFileAttributes (first-block rewrite)
 
-Both produce new copies of every in-use slot with a modified page 0 (new `Path`, or new
-`Attributes`), then free the old copies. They are transactional (nothing in `Base` changes).
+Only the **first block** of each in-use slot is rewritten: a new block receives the new page 0
+(new `Path` or `Attributes`) followed by verbatim copies of the old first block's data pages. Every
+other block of the file stays where it is and keeps its CRC. The cost is one block per slot instead
+of the whole file. They are transactional (nothing in `Base` changes).
 
 ```
 Rename(Old, New): both parse with SlotSpec NONE (else INVALID_ARGUMENT); FindEntry(New) must fail (-> PERMISSION_DENIED, as EEPROM);
@@ -1087,15 +1089,25 @@ SetFileAttributes(Name, Attr): Attr in {NONE, READONLY} else INVALID_ARGUMENT; i
 Common:
     cleanup room for (slots in use); for each in-use slot s (A then B):
         read page 0 of the slot (CORRUPT_FILE aborts the whole operation with no change; blocks allocated so far are released)
-        allocate AllocBlocks blocks -> NO_SPACE_LEFT_ON_DEVICE (release blocks allocated for an earlier slot; no change)
-        NewP0 = old P0 with Path/Attributes replaced, WriteSeq = NextWriteSeq++, ModificationDate unchanged (Rename) / now (SetAttr)
-        EEFS_NandWriteCopy(i, s, NewP0, NewBlocks)   /* 7.5; IO_ERROR -> release, no change */
-    then for each slot: FreeSlot(old); assign the new slot record (FirstBlock, AllocBlocks, WriteSeq; other fields unchanged)
+        allocate ONE block NB -> NO_SPACE_LEFT_ON_DEVICE (release an earlier slot's NB; no change)
+        NewP0 = old P0 with Path/Attributes replaced, Blocks[0].Block = NB (Blocks[0].Crc and Blocks[1..] unchanged),
+                WriteSeq = NextWriteSeq++, ModificationDate unchanged (Rename) / now (SetAttr)
+        erase NB; program NewP0 at page 0; copy pages 1..LastUsedPage(block 0) from the old first block (ReadPage -> ProgramPage);
+        verify per 7.5 (Blocks[0].Crc over the copied data); grown bad -> mark bad, pick another NB, retry (7.5 retry limit); IO_ERROR -> release, no change
+    then for each slot: map[old FirstBlock] = FREEING + cleanup(old FirstBlock); map[NB] = OWNER(i, s);
+         slot record FirstBlock = NB, WriteSeq = new (AllocBlocks and other blocks unchanged)
     Rename: Entry.Path = New.  SetAttr: Entry.Attributes = Attr.
     Touch; AUTO_COMMIT.
 ```
 
-Free space equal to the file's allocation (both slots for A/B files) is required.
+Power loss: before the commit the old first block is intact and the directory still names it, so
+the file is unchanged; after the commit the new first block is authoritative and the cleanup erase
+of the old first block is idempotent. Until that erase, the old and the new page 0 both list
+`Blocks[1..]`: mount ignores this (reconcile follows the directory's `FirstBlock`), the health check
+does not report the old page 0 as an orphan or cross-link while it is on the pending cleanup list,
+and a rebuild resolves it by the overlap rule (8.1): the higher `WriteSeq` wins.
+
+Free space of one block per in-use slot is required.
 
 ### 6.7 Read
 
@@ -1197,9 +1209,12 @@ pass 1: for b in [DirRegionBlocks, BlockCount): if Working.Map[b] == BAD skip;
         slot = P0.Slot in {A,B} ? P0.Slot : A. Find entry with Path (linear search of a scratch table of EEFS_MAX_FILES {Path, Winner[2] = {Block, WriteSeq, Explicit}});
         new path: take a free row, or ignore if full. If Winner[slot] empty or P0.WriteSeq > Winner.WriteSeq: Winner = (b, WriteSeq, P0.Slot != NONE).
         MaxPageWriteSeq = max(...).
-pass 2: for each row, each slot with a winner: read its page 0 again; Entry: InUse 1, Path, IsAB = any Explicit, FileType/Attributes/CreationDate
-        from the active slot's P0 (ActiveSlot = A present ? A : B), FallbackCompatible 0, ActiveFailed 0; Slot[s] = fields from P0;
-        for each Blocks[k]: if Map is FREE -> OWNER(row, s); else (another winner claimed it) SlotFlags CROSSLINK.
+pass 2: process the winners in DESCENDING WriteSeq order (overlap rule): read its page 0 again; if any of its Blocks[]
+        is already OWNER of a winner processed earlier (higher WriteSeq), discard this winner entirely (orphan; this is the
+        superseded page 0 of a Rename/SetAttr first-block rewrite or of a relocation whose cleanup erase was cut).
+        Otherwise: Entry (row): InUse 1, Path, IsAB = any Explicit, FileType/Attributes/CreationDate from the active slot's P0
+        (ActiveSlot = A present ? A : B), FallbackCompatible 0, ActiveFailed 0; Slot[s] = fields from P0; each Blocks[k] -> OWNER(row, s).
+        A row whose winners were all discarded is dropped.
 if no row: return EEFS_NOT_FORMATTED
 Base = Working. NextWriteSeq per 5.2 step 8.
 ```
@@ -1416,7 +1431,9 @@ DirRegionBlocks` or owner `>= 2 * EEFS_MAX_FILES` -> `MAP_MISMATCH` too. No read
 
 **Phase 4, scan.** Cursor `Block` from `DirRegionBlocks`. Read page 0 with OOB (uncached). Bad
 marker set and `Working.Map[b] != BAD` -> `BADBLOCK_UNRECORDED`. Valid metadata page (FMT 3.4,
-`ExpectBlock = b`) and `Claimed` bit clear -> `ORPHAN_FILE`. (Blocks owned by uncommitted batch
+`ExpectBlock = b`), `Claimed` bit clear and `b` not on the pending cleanup list -> `ORPHAN_FILE`
+(a block awaiting its cleanup erase, such as the old first block after a Rename/SetAttr, is
+already reported by `DIR_CLEANUP_PENDING`). (Blocks owned by uncommitted batch
 slots have been claimed in phase 2 because phase 2 iterates `Working`, so an open batch does not
 produce false orphans.)
 
@@ -1620,7 +1637,7 @@ erased), `write_all_types_roundtrip_via_getfileinfo`, `path_255_ok_256_rejected`
 (no leading `/`, second `@`, `@C`), `signature_block_present_and_excluded`, `inplace_modify_no_dir_change`
 (`Programs` of the dir region unchanged, `ForceDirty` set, next commit refreshes `WriteSeq`),
 `shrink_in_place_and_grow_relocates` (old blocks FREEING until commit, cleanup erases old page 0),
-`remove_then_commit_erases_page0`, `rename_by_copy`, `setattr_by_copy_and_readonly_rules`,
+`remove_then_commit_erases_page0`, `rename_rewrites_first_block_only` (only one new block programmed; `Blocks[1..]` unchanged; old first block erased by cleanup), `setattr_rewrites_first_block_and_readonly_rules`,
 `open_write_flags_unsupported` (`O_WRONLY`, `O_RDWR`, `O_CREAT`, `Creat`, `Write`),
 `read_lseek_across_blocks`, `batch_20_files_one_commit_one_record` (dir `Programs` before commit
 = 0; after = pages of one record x 2 mirrors; all visible), `reboot_before_commit_rolls_back`,
@@ -1653,7 +1670,7 @@ Implements: `eefs_nand_rebuild.c` (8.1, 8.3), mount step 5, `EEFS_LibRebuildDire
 Tests (suite `rebuild`): `rebuild_after_both_mirrors_erased_matches_committed_set` (10 files,
 some removed and cleaned, then raw-erase the dir region; mount returns `SUCCESS` with
 `DirectoryRebuilt`; file set, sizes, CRCs match; reads work), `rebuild_highest_writeseq_wins`
-(two page 0s for the same path: an old orphan with a lower seq loses), `rebuild_includes_uncommitted_and_uncleaned_copies`
+(two page 0s for the same path: an old orphan with a lower seq loses), `rebuild_overlap_rule_after_cut_rename` (rename committed, cleanup cut, both mirrors lost: the old-name page 0 shares `Blocks[1..]` and loses to the higher `WriteSeq`; only the new name is rebuilt), `rebuild_includes_uncommitted_and_uncleaned_copies`
 (documented caveat asserted explicitly), `rebuild_not_formatted_when_no_page0`,
 `rebuild_bad_blocks_from_oob`, `rebuild_crosslink_flagged`, `repair_directory_persists_and_clears_flag`
 (both mirrors get a CHECKPOINT with `Seq > MaxSeqSeen`; remount is normal),
@@ -1798,8 +1815,10 @@ for both backends.
 15. **`EEFS_Format(DeviceName, BaseAddress)`** takes the device pointer and registers/initializes
     the device, because `EEFS_InitFS` cannot succeed on an unformatted device and the standalone
     driver has no "remove device" call.
-16. **Rename/SetAttr/CopySlot copy page by page through the HAL** (`ReadPage`/`ProgramPage`); the
-    HAL has no block-buffer primitive. A BSP may exploit its controller buffer inside `ProgramPage`.
+16. **Rename/SetAttr rewrite only the first block** (user decision, 2026-10-15): new page 0 plus
+    a copy of block 0's data pages into one new block; the other blocks stay. CopySlot still copies
+    the whole slot (the other slot needs its own blocks). Copies go page by page through the HAL
+    (`ReadPage`/`ProgramPage`); a BSP may exploit its controller buffer inside `ProgramPage`.
 17. **`EEFS_LibWriteFile` has no separate `Type` parameter**; the type is `Meta->FileType`.
 18. **`EEFS_LibReclaimOrphans` scans the device itself** rather than consuming a health report
     (which could be stale) and never touches owned or FREEING blocks.
@@ -1821,10 +1840,8 @@ for both backends.
   change could release the lock between blocks (the batch model already tolerates it).
 - **Whole file in RAM.** `EEFS_LibWriteFile` takes the complete file in memory. A callback or
   chunked variant can be added later without format change.
-- **Rename/SetAttr copy the file** because page 0 holds `Path`/`Attributes` (per the plan). A
-  cheaper design would make the directory authoritative for `Attributes` (rebuild would take page
-  0's value as a default); a READONLY toggle on a 100 MB file currently costs a 100 MB copy. Decide
-  before phase 3 if that is unacceptable.
+- **Rename/SetAttr** rewrite only the first block (decided 2026-10-15), so a READONLY toggle on a
+  large file costs one block copy, not a full copy.
 - **NAND assumptions:** pages programmed once between erases, in ascending order; an erased page
   reads `0xFF` with status >= 0; the OOB byte at `BadMarkerOffset` is programmable independently of
   the controller's ECC bytes. Controllers whose ECC covers the OOB marker byte may reject the
