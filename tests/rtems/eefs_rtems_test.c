@@ -6,6 +6,8 @@
  *   1. reads both files back and checks their contents,
  *   2. looks a file up with MicroEEFS_FindFile, as a bootloader would,
  *   3. creates, writes and reads back a new file.
+ * With EEFS_LOCK=hooks the test supplies the lock hooks and checks that every lock is released; with EEFS_LOCK=rtems
+ * it runs on the EEFS-provided RTEMS lock (single task: no waits).
  * Prints "EEFS RTEMS TEST PASSED" or "EEFS RTEMS TEST FAILED" and exits.
  */
 
@@ -19,6 +21,9 @@
 #include "eefs_fileapi.h"
 #include "eefs_filesys.h"
 #include "microeefs.h"
+#ifdef EEFS_LIB_LOCK_RTEMS
+#include "eefs_rtems_lock.h"
+#endif
 
 extern const unsigned char eefs_test_image[];
 extern const unsigned int  eefs_test_image_size;
@@ -35,6 +40,23 @@ static int   Failures;
             Failures++;                                                 \
         }                                                               \
     } while (0)
+
+#if defined(EEFS_LIB_LOCK_HOOKS) && !defined(EEFS_LIB_LOCK_RTEMS)
+/* EEFS_LOCK=hooks: the application provides the lock; this one counts and checks nesting (one task) */
+static uint32 LockCalls;
+static int32  LockDepth;
+
+void EEFS_LibLockHook(void)
+{
+    LockCalls++;
+    LockDepth++;
+}
+
+void EEFS_LibUnlockHook(void)
+{
+    LockDepth--;
+}
+#endif
 
 static const char HelloText[] = "Hello from the EEPROM File System\n";
 
@@ -135,6 +157,16 @@ static rtems_task Init(rtems_task_argument ignored)
     check_pattern();
     check_microeefs();
     check_create();
+
+#if defined(EEFS_LIB_LOCK_HOOKS) && !defined(EEFS_LIB_LOCK_RTEMS)
+    printf("library lock hooks: %lu calls\n", (unsigned long)LockCalls);
+    CHECK(LockCalls > 0);
+    CHECK(LockDepth == 0);
+#endif
+#ifdef EEFS_LIB_LOCK_RTEMS
+    printf("EEFS RTEMS lock: %lu waits\n", (unsigned long)EEFS_RtemsLockWaits());
+    CHECK(EEFS_RtemsLockWaits() == 0);
+#endif
 
     printf(Failures == 0 ? "EEFS RTEMS TEST PASSED\n" : "EEFS RTEMS TEST FAILED (%d)\n", Failures);
     exit(Failures == 0 ? 0 : 1);

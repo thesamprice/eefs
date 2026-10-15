@@ -22,6 +22,19 @@ option(EEFS_BUILD_TOOLS     "Build the host tools (geneepromfs, eefstool-img)" $
 option(EEFS_BUILD_BDM_TOOL  "Build eefstool-bdm (needs the RTEMS 4.10 BDM headers and libraries)" OFF)
 option(EEFS_WERROR          "Treat warnings as errors where the original Makefiles did (geneepromfs)" ON)
 
+# Storage backend.  eeprom is the original memory-mapped slot file system; nand is the raw NAND backend
+# (docs/nand-format.md, docs/nand-implementation.md).
+set(EEFS_BACKEND "eeprom" CACHE STRING "EEFS storage backend: eeprom or nand")
+set_property(CACHE EEFS_BACKEND PROPERTY STRINGS eeprom nand)
+if(NOT EEFS_BACKEND MATCHES "^(eeprom|nand)$")
+    message(FATAL_ERROR "Unknown EEFS_BACKEND '${EEFS_BACKEND}' (expected eeprom or nand)")
+endif()
+if(EEFS_BACKEND STREQUAL "nand" AND EEFS_BUILD_TOOLS)
+    # geneepromfs and eefstool build and read EEPROM images only
+    message(STATUS "EEFS_BACKEND=nand: the EEPROM host tools are not built (EEFS_BUILD_TOOLS forced OFF)")
+    set(EEFS_BUILD_TOOLS OFF)
+endif()
+
 # Optional processor define for common_types.h (_ix86_, __PPC__, _m68k_ or __SPARC__).  Leave it
 # empty for everything else (ARM, AArch64, RISC-V, MicroBlaze, host builds): common_types.h then
 # takes the endianness from the compiler.
@@ -41,6 +54,32 @@ else()
 endif()
 set(EEFS_MACROS_DIR "${_eefs_default_macros_dir}" CACHE PATH "Directory containing eefs_macros.h")
 
+# Library lock (EEFS_LIB_LOCK / EEFS_LIB_UNLOCK of the standalone eefs_macros.h).  none: empty macros, for one task
+# (the default, unchanged).  hooks: the macros call EEFS_LibLockHook() / EEFS_LibUnlockHook(), which the application
+# provides.  rtems: the same hooks, implemented by EEFS (drivers/standalone_driver/eefs_rtems_lock.c) with a statically
+# initialized RTEMS recursive mutex that uses priority inheritance; RTEMS targets only.  Several tasks that use the
+# library (for example a background NAND health check next to writer tasks) need hooks or rtems.
+set(EEFS_LOCK "none" CACHE STRING "EEFS library lock: none, hooks or rtems")
+set_property(CACHE EEFS_LOCK PROPERTY STRINGS none hooks rtems)
+if(NOT EEFS_LOCK MATCHES "^(none|hooks|rtems)$")
+    message(FATAL_ERROR "Unknown EEFS_LOCK '${EEFS_LOCK}' (expected none, hooks or rtems)")
+endif()
+if(NOT EEFS_LOCK STREQUAL "none")
+    if(NOT EEFS_DRIVER STREQUAL "standalone")
+        message(FATAL_ERROR "EEFS_LOCK=${EEFS_LOCK} needs EEFS_DRIVER=standalone (the ${EEFS_DRIVER} driver's "
+            "eefs_macros.h has its own lock)")
+    endif()
+    if(NOT EEFS_MACROS_DIR STREQUAL "${PROJECT_SOURCE_DIR}/drivers/standalone_driver")
+        message(WARNING "EEFS_LOCK=${EEFS_LOCK} with a custom EEFS_MACROS_DIR: its eefs_macros.h must route "
+            "EEFS_LIB_LOCK/EEFS_LIB_UNLOCK to EEFS_LibLockHook()/EEFS_LibUnlockHook() when EEFS_LIB_LOCK_HOOKS is "
+            "defined, as drivers/standalone_driver/eefs_macros.h does")
+    endif()
+endif()
+if(EEFS_LOCK STREQUAL "rtems" AND NOT RTEMS_BSP)
+    message(FATAL_ERROR "EEFS_LOCK=rtems needs an RTEMS target (configure with "
+        "-DCMAKE_TOOLCHAIN_FILE=cmake/rtems-toolchain.cmake); use EEFS_LOCK=hooks to supply your own lock")
+endif()
+
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(EEFS_WARNING_FLAGS -Wall -W -Wstrict-prototypes -Wundef)
 endif()
@@ -56,6 +95,9 @@ target_include_directories(eefs_headers INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/eefs>)
 if(EEFS_ARCH_DEFINE)
     target_compile_definitions(eefs_headers INTERFACE ${EEFS_ARCH_DEFINE})
+endif()
+if(EEFS_BACKEND STREQUAL "nand")
+    target_compile_definitions(eefs_headers INTERFACE EEFS_BACKEND_NAND)
 endif()
 
 #
@@ -75,16 +117,50 @@ endif()
 if(NOT DEFINED EEFS_DRIVER_SOURCES_${EEFS_DRIVER})
     message(FATAL_ERROR "Unknown EEFS_DRIVER '${EEFS_DRIVER}' (expected standalone, vxworks or rtems)")
 endif()
+if(EEFS_BACKEND STREQUAL "nand" AND NOT EEFS_DRIVER STREQUAL "standalone")
+    message(FATAL_ERROR "EEFS_BACKEND=nand needs EEFS_DRIVER=standalone")
+endif()
+
+# NAND backend library sources (also compiled into the host test library, tests/nand)
+set(EEFS_NAND_LIB_SOURCES
+    libraries/eefs_nand/eefs_crc32.c
+    libraries/eefs_nand/eefs_nand_format.c
+    libraries/eefs_nand/eefs_nand_io.c
+    libraries/eefs_nand/eefs_nand_journal.c
+    libraries/eefs_nand/eefs_nand_rebuild.c
+    libraries/eefs_nand/eefs_nand_fileapi.c
+    libraries/eefs_nand/eefs_nand_health.c)
+
+if(EEFS_BACKEND STREQUAL "nand")
+    set(_eefs_core_sources ${EEFS_NAND_LIB_SOURCES})
+else()
+    set(_eefs_core_sources libraries/eepromfs/eefs_fileapi.c)
+endif()
+
+# The EEFS-provided RTEMS lock (EEFS_LOCK=rtems); also compiled into the RTEMS NAND test's locked library
+set(EEFS_RTEMS_LOCK_SOURCES drivers/standalone_driver/eefs_rtems_lock.c)
+if(EEFS_LOCK STREQUAL "rtems")
+    set(_eefs_lock_sources ${EEFS_RTEMS_LOCK_SOURCES})
+else()
+    set(_eefs_lock_sources "")
+endif()
 
 add_library(eefs STATIC
-    libraries/eepromfs/eefs_fileapi.c
-    ${EEFS_DRIVER_SOURCES_${EEFS_DRIVER}})
+    ${_eefs_core_sources}
+    ${EEFS_DRIVER_SOURCES_${EEFS_DRIVER}}
+    ${_eefs_lock_sources})
 add_library(eefs::eefs ALIAS eefs)
 target_link_libraries(eefs PUBLIC eefs_headers)
 target_include_directories(eefs PUBLIC
     $<BUILD_INTERFACE:${EEFS_MACROS_DIR}>
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/drivers/${EEFS_DRIVER}_driver>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/eefs>)
+# PUBLIC, so that every consumer of eefs_macros.h sees the same lock macros
+if(EEFS_LOCK STREQUAL "hooks")
+    target_compile_definitions(eefs PUBLIC EEFS_LIB_LOCK_HOOKS)
+elseif(EEFS_LOCK STREQUAL "rtems")
+    target_compile_definitions(eefs PUBLIC EEFS_LIB_LOCK_HOOKS EEFS_LIB_LOCK_RTEMS)
+endif()
 target_compile_options(eefs PRIVATE ${EEFS_WARNING_FLAGS})
 set_target_properties(eefs PROPERTIES C_STANDARD 90 C_EXTENSIONS OFF)
 
@@ -92,12 +168,24 @@ set_target_properties(eefs PROPERTIES C_STANDARD 90 C_EXTENSIONS OFF)
 # microeefs: single-function file lookup for bootloaders
 #
 
-add_library(microeefs STATIC libraries/microeefs/microeefs.c)
+if(EEFS_BACKEND STREQUAL "nand")
+    # bootloader library: the lookup plus the pure format module and the CRC
+    set(_microeefs_dir libraries/microeefs_nand)
+    set(_microeefs_sources
+        libraries/microeefs_nand/microeefs_nand.c
+        libraries/eefs_nand/eefs_nand_format.c
+        libraries/eefs_nand/eefs_crc32.c)
+else()
+    set(_microeefs_dir libraries/microeefs)
+    set(_microeefs_sources libraries/microeefs/microeefs.c)
+endif()
+
+add_library(microeefs STATIC ${_microeefs_sources})
 add_library(eefs::microeefs ALIAS microeefs)
 target_link_libraries(microeefs PUBLIC eefs_headers)
 target_include_directories(microeefs
     PUBLIC
-        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/libraries/microeefs>
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/${_microeefs_dir}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/eefs>
     PRIVATE
         ${EEFS_MACROS_DIR})
@@ -117,8 +205,11 @@ endif()
 #
 
 include(CTest)
-if(BUILD_TESTING AND EEFS_BUILD_TOOLS)
+if(BUILD_TESTING AND EEFS_BUILD_TOOLS AND EEFS_BACKEND STREQUAL "eeprom")
     add_subdirectory(tests)
+endif()
+if(BUILD_TESTING AND EEFS_BACKEND STREQUAL "nand" AND NOT CMAKE_CROSSCOMPILING)
+    add_subdirectory(tests/nand)
 endif()
 # RTEMS_BSP is set by cmake/rtems-toolchain.cmake
 if(BUILD_TESTING AND RTEMS_BSP)
@@ -138,8 +229,24 @@ install(FILES
         inc/eefs_fileapi.h
         inc/eefs_version.h
         ${EEFS_MACROS_DIR}/eefs_macros.h
-        libraries/microeefs/microeefs.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
+if(EEFS_BACKEND STREQUAL "nand")
+    install(FILES
+            inc/eefs_nand.h
+            inc/eefs_nand_format.h
+            inc/eefs_nand_hal.h
+            inc/eefs_nand_types.h
+            libraries/microeefs_nand/microeefs_nand.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
+else()
+    install(FILES
+            inc/eefs_eeprom_types.h
+            libraries/microeefs/microeefs.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
+endif()
+if(EEFS_LOCK STREQUAL "rtems")
+    install(FILES drivers/standalone_driver/eefs_rtems_lock.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
+endif()
 if(EEFS_DRIVER STREQUAL "standalone")
     install(FILES drivers/standalone_driver/eefs_filesys.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
 elseif(EEFS_DRIVER STREQUAL "vxworks")

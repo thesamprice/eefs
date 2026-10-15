@@ -49,6 +49,10 @@ int32                    EEFS_FreeDevice(EEFS_Device_t *Device);
 EEFS_Volume_t           *EEFS_FindVolume(char *MountPoint);
 EEFS_Volume_t           *EEFS_GetVolume(void);
 int32                    EEFS_FreeVolume(EEFS_Volume_t *Volume);
+#ifdef EEFS_BACKEND_NAND
+static int32             EEFS_ResolvePath(char *Path, EEFS_SplitPath_t *SplitPath, EEFS_Device_t **Device);
+static int32             EEFS_ResolveMountPoint(char *MountPoint, EEFS_Device_t **Device);
+#endif
 
 /*
  * Function Definitions
@@ -163,6 +167,12 @@ int32 EEFS_UnMount(char *MountPoint)
                     if ((EEFS_LibHasOpenFiles(&Device->InodeTable) == FALSE) &&
                         (EEFS_LibHasOpenDir(&Device->InodeTable) == FALSE)) {
 
+#ifdef EEFS_BACKEND_NAND
+                        /* unmount commits the pending batch (call EEFS_Abort first to drop it) */
+                        if (EEFS_LibCommit(&Device->InodeTable) != EEFS_SUCCESS) {
+                            return(EEFS_ERROR);
+                        }
+#endif
                         ReturnCode = EEFS_FreeVolume(Volume);
                     }
                     else { /* can't unmount a volume while files are open */
@@ -569,7 +579,12 @@ int32 EEFS_SplitPath(char *InputPath, EEFS_SplitPath_t *SplitPath)
 
                     /* This removes the '/' from the filename */
                     strncpy(SplitPath->MountPoint, InputPath, i);
+#ifdef EEFS_BACKEND_NAND
+                    /* NAND paths are absolute: "/NAND0/cf/apps/x.so" -> "/NAND0" + "/cf/apps/x.so" */
+                    strncpy(SplitPath->Filename, &(InputPath[i]), EEFS_MAX_PATH_SIZE - 1);
+#else
                     strncpy(SplitPath->Filename, &(InputPath[i+1]), EEFS_MAX_PATH_SIZE);
+#endif
                     ReturnCode = EEFS_SUCCESS;
                 }
                 else { /* missing second '/' */
@@ -662,3 +677,314 @@ int32 EEFS_FreeVolume(EEFS_Volume_t *Volume)
     }
     return(EEFS_ERROR);
 }
+
+#ifdef EEFS_BACKEND_NAND
+
+/*
+ * NAND backend wrappers.  They return the EEFS_Lib* code unchanged once the path resolved, and EEFS_ERROR when the
+ * path, volume or device could not be resolved.
+ */
+
+/* Formats a NAND device and initializes it */
+int32 EEFS_Format(char *DeviceName, cpuaddr BaseAddress)
+{
+    EEFS_Device_t               *Device;
+    uint32                       i;
+    int32                        ReturnCode;
+    boolean                      NewDevice = FALSE;
+
+    if ((DeviceName == NULL) || (strlen(DeviceName) >= EEFS_MAX_DEVICENAME_SIZE) ||
+        (DeviceName[0] != '/') || (BaseAddress == 0)) {
+        return(EEFS_ERROR);
+    }
+
+    /* the BaseAddress must not belong to another device */
+    for (i=0; i < EEFS_MAX_DEVICES; i++) {
+        if ((EEFS_DeviceTable[i].InUse == TRUE) &&
+            (EEFS_DeviceTable[i].BaseAddress == BaseAddress) &&
+            (strncmp(EEFS_DeviceTable[i].DeviceName, DeviceName, EEFS_MAX_DEVICENAME_SIZE) != 0))
+            return(EEFS_ERROR);
+    }
+
+    if ((Device = EEFS_FindDevice(DeviceName)) != NULL) {
+
+        /* an existing device must not be mounted */
+        for (i=0; i < EEFS_MAX_VOLUMES; i++) {
+            if ((EEFS_VolumeTable[i].InUse == TRUE) &&
+                (strncmp(EEFS_VolumeTable[i].DeviceName, DeviceName, EEFS_MAX_DEVICENAME_SIZE) == 0))
+                return(EEFS_ERROR);
+        }
+
+        /* release its file system so that it can be used as scratch RAM by the format */
+        if (Device->InodeTable.Mounted != 0) {
+            if ((ReturnCode = EEFS_LibFreeFS(&Device->InodeTable)) != EEFS_SUCCESS) {
+                return(ReturnCode);
+            }
+        }
+    }
+    else if ((Device = EEFS_GetDevice()) != NULL) {
+        NewDevice = TRUE;
+        strncpy(Device->DeviceName, DeviceName, EEFS_MAX_DEVICENAME_SIZE);
+    }
+    else { /* can't allocate new device */
+        return(EEFS_ERROR);
+    }
+
+    Device->BaseAddress = BaseAddress;
+    if ((ReturnCode = EEFS_LibFormat(&Device->InodeTable, BaseAddress)) == EEFS_SUCCESS) {
+        ReturnCode = EEFS_LibInitFS(&Device->InodeTable, BaseAddress);
+    }
+    if ((ReturnCode != EEFS_SUCCESS) && (NewDevice == TRUE)) {
+        EEFS_FreeDevice(Device);
+    }
+
+    return(ReturnCode);
+}
+
+/* Writes a whole file into the pending batch */
+int32 EEFS_WriteFile(char *Path, const EEFS_NandFileInfo_t *Meta, const void *Data, uint32 Size)
+{
+    EEFS_SplitPath_t             SplitPath;
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolvePath(Path, &SplitPath, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibWriteFile(&Device->InodeTable, SplitPath.Filename, Meta, Data, Size));
+}
+
+/* Commits the pending batch of a volume */
+int32 EEFS_Commit(char *MountPoint)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibCommit(&Device->InodeTable));
+}
+
+/* Discards the pending batch of a volume */
+int32 EEFS_Abort(char *MountPoint)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibAbort(&Device->InodeTable));
+}
+
+/* Space and state of a volume */
+int32 EEFS_GetVolumeInfo(char *MountPoint, EEFS_NandVolumeInfo_t *Info)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibGetVolumeInfo(&Device->InodeTable, Info));
+}
+
+/* Checks every CRC of a file */
+int32 EEFS_VerifyFile(char *Path)
+{
+    EEFS_SplitPath_t             SplitPath;
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolvePath(Path, &SplitPath, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibVerifyFile(&Device->InodeTable, SplitPath.Filename));
+}
+
+/* Returns the directory entry and type info of a file */
+int32 EEFS_GetFileInfo(char *Path, EEFS_NandFileInfo_t *Info)
+{
+    EEFS_SplitPath_t             SplitPath;
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolvePath(Path, &SplitPath, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibGetFileInfo(&Device->InodeTable, SplitPath.Filename, Info));
+}
+
+/* Selects the active slot of an A/B file */
+int32 EEFS_SetActiveSlot(char *Path, uint8 Slot)
+{
+    EEFS_SplitPath_t             SplitPath;
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolvePath(Path, &SplitPath, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibSetActiveSlot(&Device->InodeTable, SplitPath.Filename, Slot));
+}
+
+/* Selects the active slot of every A/B file of a volume */
+int32 EEFS_SetActiveSlotAll(char *MountPoint, uint8 Slot)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibSetActiveSlotAll(&Device->InodeTable, Slot));
+}
+
+/* Sets the compatible-fallback flag of an A/B file */
+int32 EEFS_SetFallbackCompatible(char *Path, uint8 Flag)
+{
+    EEFS_SplitPath_t             SplitPath;
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolvePath(Path, &SplitPath, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibSetFallbackCompatible(&Device->InodeTable, SplitPath.Filename, Flag));
+}
+
+/* Sets the compatible-fallback flag of every A/B file of a volume */
+int32 EEFS_SetFallbackCompatibleAll(char *MountPoint, uint8 Flag)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibSetFallbackCompatibleAll(&Device->InodeTable, Flag));
+}
+
+/* Records that the active copy of an A/B file failed */
+int32 EEFS_SetFailed(char *Path)
+{
+    EEFS_SplitPath_t             SplitPath;
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolvePath(Path, &SplitPath, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibSetFailed(&Device->InodeTable, SplitPath.Filename));
+}
+
+/* Clears the failed flag of an A/B file */
+int32 EEFS_ClearFailed(char *Path)
+{
+    EEFS_SplitPath_t             SplitPath;
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolvePath(Path, &SplitPath, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibClearFailed(&Device->InodeTable, SplitPath.Filename));
+}
+
+/* Copies one slot of a file into the other */
+int32 EEFS_CopySlot(char *Path, uint8 From, uint8 To)
+{
+    EEFS_SplitPath_t             SplitPath;
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolvePath(Path, &SplitPath, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibCopySlot(&Device->InodeTable, SplitPath.Filename, From, To));
+}
+
+/* Copies one slot into the other for every A/B file of a volume */
+int32 EEFS_CopySlotAll(char *MountPoint, uint8 From, uint8 To)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibCopySlotAll(&Device->InodeTable, From, To));
+}
+
+/* Commits and writes a fresh checkpoint to both directory mirrors */
+int32 EEFS_RepairDirectory(char *MountPoint)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibRepairDirectory(&Device->InodeTable));
+}
+
+/* Rebuilds the RAM directory from the metadata pages */
+int32 EEFS_RebuildDirectory(char *MountPoint)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibRebuildDirectory(&Device->InodeTable));
+}
+
+/* Erases free blocks that still hold a valid metadata page */
+int32 EEFS_ReclaimOrphans(char *MountPoint)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibReclaimOrphans(&Device->InodeTable));
+}
+
+/* Starts a health check of a volume */
+int32 EEFS_HealthCheckStart(char *MountPoint, EEFS_HealthReport_t *Report)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibHealthCheckStart(&Device->InodeTable, Report));
+}
+
+/* Runs a step of the health check of a volume */
+int32 EEFS_HealthCheckStep(char *MountPoint, uint32 MaxPageReads)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibHealthCheckStep(&Device->InodeTable, MaxPageReads));
+}
+
+/* Returns the last completed health report of a volume */
+int32 EEFS_HealthCheckSummary(char *MountPoint, EEFS_HealthSummary_t *Out)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibHealthCheckSummary(&Device->InodeTable, Out));
+}
+
+/* Detaches the running health check of a volume */
+int32 EEFS_HealthCheckCancel(char *MountPoint)
+{
+    EEFS_Device_t               *Device;
+
+    if (EEFS_ResolveMountPoint(MountPoint, &Device) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    return(EEFS_LibHealthCheckCancel(&Device->InodeTable));
+}
+
+/* Splits Path and finds the device of its mount point */
+static int32 EEFS_ResolvePath(char *Path, EEFS_SplitPath_t *SplitPath, EEFS_Device_t **Device)
+{
+    EEFS_Volume_t               *Volume;
+
+    if (EEFS_SplitPath(Path, SplitPath) != EEFS_SUCCESS)
+        return(EEFS_ERROR);
+    if ((Volume = EEFS_FindVolume(SplitPath->MountPoint)) == NULL)
+        return(EEFS_ERROR);
+    if ((*Device = EEFS_FindDevice(Volume->DeviceName)) == NULL)
+        return(EEFS_ERROR);
+    return(EEFS_SUCCESS);
+}
+
+/* Finds the device of a mount point */
+static int32 EEFS_ResolveMountPoint(char *MountPoint, EEFS_Device_t **Device)
+{
+    EEFS_Volume_t               *Volume;
+
+    if ((MountPoint == NULL) || (strlen(MountPoint) >= EEFS_MAX_MOUNTPOINT_SIZE) || (MountPoint[0] != '/'))
+        return(EEFS_ERROR);
+    if ((Volume = EEFS_FindVolume(MountPoint)) == NULL)
+        return(EEFS_ERROR);
+    if ((*Device = EEFS_FindDevice(Volume->DeviceName)) == NULL)
+        return(EEFS_ERROR);
+    return(EEFS_SUCCESS);
+}
+
+#endif /* EEFS_BACKEND_NAND */

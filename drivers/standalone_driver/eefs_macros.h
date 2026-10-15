@@ -34,9 +34,20 @@
 #define EEFS_LIB_EEPROM_FLUSH
 
 /* These macros define the lock and unlock interface functions used to guarentee
- * exclusive access to shared resources.  Defaults to undefined since it is implementation dependent */
+ * exclusive access to shared resources.  Defaults to undefined since it is implementation dependent.
+ * With EEFS_LIB_LOCK_HOOKS defined they call EEFS_LibLockHook() and EEFS_LibUnlockHook(): one recursive mutex for the
+ * whole library, needed when several tasks use the library (e.g. a background NAND health check next to writers, see
+ * docs/nand-implementation.md section 13).  CMake EEFS_LOCK=hooks defines it and the application provides the hooks;
+ * EEFS_LOCK=rtems defines it and links the EEFS-provided RTEMS implementation (eefs_rtems_lock.c). */
+#ifdef EEFS_LIB_LOCK_HOOKS
+extern void EEFS_LibLockHook(void);
+extern void EEFS_LibUnlockHook(void);
+#define EEFS_LIB_LOCK                           EEFS_LibLockHook()
+#define EEFS_LIB_UNLOCK                         EEFS_LibUnlockHook()
+#else
 #define EEFS_LIB_LOCK
 #define EEFS_LIB_UNLOCK
+#endif
 
 /* This macro defines the time interface function.  Defaults to time(NULL) */
 #define EEFS_LIB_TIME                           time(NULL)
