@@ -171,6 +171,11 @@ maximum `BlockCount` is `floor((PageSize - 1532) / 6)`:
 
 `FileSize` is also limited to `0xFFFFFFFF` and by the number of free data blocks.
 
+`Blocks[]` is the only block-chaining structure: data blocks carry no header and no "next block"
+pointer. That is deliberate: a modification that changes one data block then costs one new data
+block plus one new first block (3.5), whereas per-block next pointers would force every block before
+the changed one to be rewritten as well.
+
 ### 3.4 Validity of a metadata page
 
 A metadata page is **valid** when all of the following hold:
@@ -185,6 +190,30 @@ A metadata page is **valid** when all of the following hold:
 
 A file's **content** is valid when its metadata page is valid and every `Blocks[i].Crc32` and
 `FileCrc32` match the data read.
+
+### 3.5 Copy-on-write: how a file is modified
+
+A file's blocks are never erased and rewritten in place. Rewriting a file produces:
+
+- a **new first block** with a new metadata page (new `WriteSeq`, `FileSize`, `FileCrc32`,
+  `Blocks[]`) and the data pages of the first block;
+- a fresh block for every data block whose content changed;
+- the **same physical block**, listed again in the new `Blocks[]`, for every data block whose
+  content did not change.
+
+The directory then switches the slot's `FirstBlock` to the new block in the next commit, and the
+old first block is erased by that commit's cleanup. Renaming a file or changing its attributes is
+the degenerate case where only the first block is new and every data block is kept.
+
+Consequences for readers:
+
+- Between the commit and the cleanup erase, the old and the new metadata page both exist and list
+  some of the same blocks. The directory names exactly one of them. A reader that has no directory
+  (section 6) resolves the overlap by `WriteSeq`: the newer page wins and the older one is an
+  orphan.
+- Before the commit, the old copy is untouched (its blocks are still owned by it in the committed
+  map) and the new blocks are free space in the committed map. A power cut leaves the old copy.
+- Two slots (A and B) of one file never share blocks: `CopySlot` copies every block.
 
 ## 4. The directory log
 
@@ -353,9 +382,9 @@ Slot record (28 bytes):
 | 20 | 4 | `FileCrc32` | Copy of the metadata page value |
 | 24 | 4 | `ModificationDate` | Copy of the metadata page value |
 
-The copied fields may be **stale** when the file was modified in place (which does not require a
-commit); the metadata page wins. `FirstBlock` and `AllocBlocks` are never stale: changing them
-requires a commit.
+Every change to a file's content writes a new first block (copy-on-write, see 3.5) and is
+committed together with the directory, so in a committed state the copied fields always equal the
+metadata page of `FirstBlock`. A difference means corruption; the metadata page wins.
 
 #### 4.3.4 CLEANUP (Type 4, Len 4 + 2 * Count)
 
@@ -452,8 +481,9 @@ Used only when neither mirror has a valid checkpoint.
    block number wins. Losers are orphans.
 3. **Overlap rule:** take the winners in descending `WriteSeq` order. A winner that lists a block
    already claimed by a winner with a higher `WriteSeq` is discarded entirely (orphan). This
-   resolves the superseded page 0 left by a rename or attribute change (which rewrites only the
-   first block, so the old and new page 0 share `Blocks[1..]`) when its cleanup erase was cut.
+   resolves the superseded page 0 left by any copy-on-write rewrite (3.5: a modification, a
+   rename or an attribute change, whose old and new page 0 share the unchanged data blocks) when
+   its cleanup erase was cut.
    Each remaining winner claims the blocks in its `Blocks[]`. Group winners by `Path` into entries (at most
    `EEFS_MAX_FILES`; further paths are ignored and remain orphans). For each entry:
    `IsAB` = 1 if any winner has `Slot` A or B explicitly; `ActiveSlot` = A if slot A is present,
@@ -533,8 +563,9 @@ page buffer re-reads page 0 at each block transition; it is one extra page read 
 
 | Interrupted operation | What a reader sees |
 |---|---|
-| Writing a new file or a relocated copy, before commit | Directory unchanged. The partially written blocks are free in the map; a complete metadata page there is an orphan. |
-| In-place modify of an existing file | Directory unchanged; the metadata page or a block CRC does not match: `EEFS_CORRUPT_FILE`. Never silently wrong data, provided the reader checks the CRCs (the library does so at open by default; the bootloader always does). |
+| Writing a new file, before commit | Directory unchanged. The partially written blocks are free in the map; a complete metadata page there is an orphan. |
+| Rewriting an existing file (copy-on-write, 3.5), before commit | Directory unchanged and the old copy intact: none of its blocks was erased or programmed. The new blocks are free in the committed map; a complete new metadata page there is an orphan that shares the kept data blocks with the live copy (resolved by `WriteSeq` on a rebuild). The reader sees exactly the old content. |
+| Rewriting an existing file, after commit, before cleanup | The new copy is live. The old metadata page still exists; its block is on the pending cleanup list and is erased by the next commit. |
 | Commit, during mirror 0's record | Both mirrors still end with `Seq = S-1`. The torn record is ignored. |
 | Commit, between mirror 0 and mirror 1 | Mirror 0 ends with `S`, mirror 1 with `S-1`. The state is `S`. The library brings mirror 1 up to date with a checkpoint at its next commit. |
 | Commit, during cleanup | State `S`, pending cleanup in the newest record. The library finishes it before its next write. |

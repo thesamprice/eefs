@@ -88,9 +88,12 @@ pass.
 `${EEFS_NAND_LIB_SOURCES}` + `drivers/standalone_driver/eefs_filesys.c` + `nand_sim.c` with
 `-DEEFS_BACKEND_NAND -DEEFS_NAND_MAX_PAGE_SIZE=8192 -DEEFS_NAND_MAX_OOB_SIZE=448` (so one binary
 serves all geometries and the override path is exercised), one executable `eefs_nand_test` from
-`nand_test_main.c` + all `test_*.c`, and a second executable `eefs_nand_test_default` built the same
+`nand_test_main.c` + all `test_*.c`, a second executable `eefs_nand_test_default` built the same
 way but linked against the real `eefs` target (default maxima) that is only registered for the
-target geometry. Tests are registered as:
+target geometry, and a third, `eefs_nand_test_verifyopen`, linked against a second copy of the
+test library (`eefs_nand_testlib_verifyopen`) compiled with `-DEEFS_NAND_VERIFY_ON_OPEN=1`, so that
+the optional open-time data verification keeps being built and tested although it is off by
+default. Tests are registered as:
 
 ```cmake
 set(EEFS_NAND_GEOMETRIES 4096:224:128 2048:64:64 8192:448:64)   # PageSize:OobSize:PagesPerBlock
@@ -104,6 +107,8 @@ foreach(geom_text IN LISTS EEFS_NAND_GEOMETRIES)
     endforeach()
 endforeach()
 add_test(NAME nand_default_config_4096 COMMAND eefs_nand_test_default fileops 4096 224 128 4096)
+add_test(NAME nand_verify_on_open_4096 COMMAND eefs_nand_test_verifyopen fileops 4096 224 128 4096)
+add_test(NAME nand_verify_on_open_ab_4096 COMMAND eefs_nand_test_verifyopen ab 4096 224 128 4096)
 ```
 
 `eefs_nand_test <suite> <page> <oob> <ppb> <blocks> [case-substring]` runs every case of the suite
@@ -187,14 +192,17 @@ only). `tools/geneepromfs/eefs_config.h` is **not** touched.
 #ifndef EEFS_NAND_MAX_CLEANUP_BLOCKS
 #define EEFS_NAND_MAX_CLEANUP_BLOCKS     256     /* pending cleanup list; overflow = EEFS_TRANSACTION_ERROR */
 #endif
-#ifndef EEFS_NAND_CREAT_SPARE_BLOCKS
-#define EEFS_NAND_CREAT_SPARE_BLOCKS     0       /* extra blocks allocated to new/relocated files */
+#ifndef EEFS_NAND_RESERVE_BLOCKS
+#define EEFS_NAND_RESERVE_BLOCKS         16      /* free blocks held back from new-file and CopySlot allocations (6.9) */
+#endif
+#ifndef EEFS_NAND_BADBLOCK_RESERVE
+#define EEFS_NAND_BADBLOCK_RESERVE       4       /* free blocks held back from everything but grown-bad replacement (6.9) */
 #endif
 #ifndef EEFS_NAND_VERIFY_WRITES
 #define EEFS_NAND_VERIFY_WRITES          1       /* read back every programmed page */
 #endif
 #ifndef EEFS_NAND_VERIFY_ON_OPEN
-#define EEFS_NAND_VERIFY_ON_OPEN         1       /* Open checks all block CRCs, not just page 0 */
+#define EEFS_NAND_VERIFY_ON_OPEN         0       /* 1: Open also checks every block CRC and the file CRC (6.4). Default: page 0 only. */
 #endif
 #ifndef EEFS_NAND_AUTO_COMMIT
 #define EEFS_NAND_AUTO_COMMIT            0
@@ -214,9 +222,15 @@ only). `tools/geneepromfs/eefs_config.h` is **not** touched.
 #if defined(EEFS_BACKEND_NAND) && (EEFS_MAX_FILES > 126)
 #error "EEFS_MAX_FILES must be <= 126 for the NAND block map encoding"
 #endif
+#if defined(EEFS_BACKEND_NAND) && (EEFS_NAND_BADBLOCK_RESERVE > EEFS_NAND_RESERVE_BLOCKS)
+#error "EEFS_NAND_BADBLOCK_RESERVE must be <= EEFS_NAND_RESERVE_BLOCKS"
+#endif
 ```
 
 (The `EEFS_MAX_FILES` check applies to the NAND backend only, so the EEPROM build keeps its old limits.)
+`EEFS_NAND_CREAT_SPARE_BLOCKS`, which phase 1 added, is **removed**: spare blocks only served
+in-place growth, which no longer exists (6.2). A file's allocation is always exactly the blocks it
+needs.
 
 ### 2.3 `inc/eefs_nand_hal.h`
 
@@ -490,9 +504,10 @@ typedef struct {             /* result of scanning one mirror (5.3); also used b
 typedef struct {
     EEFS_NandDevice_t    *Dev;               /* from BaseAddress */
     uint32                Mounted;
-    EEFS_NandDirState_t   Base;              /* committed state as on media (plus in-place refreshes, 6.2) */
+    EEFS_NandDirState_t   Base;              /* committed state as on media (plus the media facts noted in section 4) */
     EEFS_NandDirState_t   Working;           /* pending state */
-    uint8                 ForceDirty[(EEFS_MAX_FILES + 7) / 8];   /* entries to include in the next record regardless of diff */
+    uint8                 ForceDirty[(EEFS_MAX_FILES + 7) / 8];   /* entries to include in the next record regardless of diff (section 4) */
+    uint32                AllocCursor;       /* round-robin allocation cursor, RAM only (6.9) */
     uint8                 SlotFlags[EEFS_MAX_FILES][2];
     uint32                NextWriteSeq;
     uint32                LastSeq;           /* newest committed record Seq */
@@ -534,8 +549,9 @@ typedef struct {
 2 x 25,092 + 2 x 4,096 + 224 + 512 (cleanup) + 128 + ~2,700 (`LastReport`) + ~300 = **~61.7 KB**;
 two devices (`EEFS_MAX_DEVICES` = 2) need ~124 KB of static RAM. The global descriptor table
 adds 20 x 40 bytes. Knobs: `EEFS_MAX_FILES` and `EEFS_NAND_MAX_PATH_SIZE` dominate (each 64-entry
-table is 21 KB); `EEFS_NAND_MAX_BLOCKS` is 4 KB per copy. (The plan estimated ~15 KB; the
-difference is the second copy of the entry table needed for Abort, and the cached health summary.)
+table is 21 KB); `EEFS_NAND_MAX_BLOCKS` is 4 KB per copy. The plan estimated ~15 KB; the
+difference is the second copy of the entry table needed for Abort, and the cached health summary.
+This budget was accepted by the user on 2026-10-15.
 
 ### 2.6 `inc/eefs_nand.h` (public NAND API; includes `eefs_fileapi.h`)
 
@@ -571,6 +587,26 @@ int32 EEFS_LibVerifyFile(EEFS_InodeTable_t *T, char *Name);
  * EEFS_SUCCESS, EEFS_FILE_NOT_FOUND, EEFS_CORRUPT_FILE (page 0 invalid; Info is still filled from the directory, Type
  * zeroed), EEFS_IO_ERROR. */
 int32 EEFS_LibGetFileInfo(EEFS_InodeTable_t *T, char *Name, EEFS_NandFileInfo_t *Info);
+
+/* Space and state of the volume (6.9). No NAND reads. EEFS_SUCCESS. */
+typedef struct {
+    uint32  BlockCount, DirRegionBlocks, DataBlocks;   /* DataBlocks = BlockCount - DirRegionBlocks */
+    uint32  FreeBlocks;             /* map == FREE, including blocks awaiting a pending cleanup erase */
+    uint32  FreeingBlocks;          /* freed in the open batch; free after the next commit */
+    uint32  UsedBlocks;             /* owned by a slot in Working (committed or pending) */
+    uint32  BadBlocks;              /* map == BAD, both regions */
+    uint32  ReserveBlocks;          /* EEFS_NAND_RESERVE_BLOCKS */
+    uint32  BadBlockReserve;        /* EEFS_NAND_BADBLOCK_RESERVE */
+    uint32  AvailableForNew;        /* FreeBlocks > ReserveBlocks ? FreeBlocks - ReserveBlocks : 0 */
+    uint32  AvailableForModify;     /* FreeBlocks > BadBlockReserve ? FreeBlocks - BadBlockReserve : 0 */
+    uint32  FilesInUse, SlotsInUse;
+    uint32  LastSeq, NextWriteSeq;
+    uint32  PendingCleanup;         /* entries on the list (from media and from the batch) */
+    uint8   DirectoryRebuilt;
+    uint8   UncommittedChanges;     /* Working != Base, or ForceDirty set */
+    uint8   MirrorValid[2];         /* Mirror[m].HasState && !Disabled */
+} EEFS_NandVolumeInfo_t;
+int32 EEFS_LibGetVolumeInfo(EEFS_InodeTable_t *T, EEFS_NandVolumeInfo_t *Info);
 
 /* A/B. Section 7. Name must not carry a suffix for these. */
 int32 EEFS_LibSetActiveSlot(EEFS_InodeTable_t *T, char *Name, uint8 Slot);        /* SUCCESS, FILE_NOT_FOUND (entry or that slot not in use), INVALID_ARGUMENT (not IsAB, bad slot) */
@@ -633,6 +669,7 @@ int32 EEFS_Commit(char *MountPoint);
 int32 EEFS_Abort(char *MountPoint);
 int32 EEFS_VerifyFile(char *Path);
 int32 EEFS_GetFileInfo(char *Path, EEFS_NandFileInfo_t *Info);
+int32 EEFS_GetVolumeInfo(char *MountPoint, EEFS_NandVolumeInfo_t *Info);
 int32 EEFS_SetActiveSlot(char *Path, uint8 Slot);
 int32 EEFS_SetActiveSlotAll(char *MountPoint, uint8 Slot);
 int32 EEFS_SetFallbackCompatible(char *Path, uint8 Flag);
@@ -744,11 +781,22 @@ int32   EEFS_NandParseName(const char *Name, char *Path /* EEFS_NAND_MAX_PATH_SI
         /* strips a trailing "@A"/"@B" (case-sensitive); SlotSpec = A, B or NONE. EEFS_INVALID_ARGUMENT if Path is empty, does not start with '/', is >= EEFS_NAND_MAX_PATH_SIZE, or contains a second '@'. */
 int32   EEFS_NandFindEntry(Vol, const char *Path);           /* index in Working, or EEFS_FILE_NOT_FOUND */
 int32   EEFS_NandAllocEntry(Vol);                            /* lowest index with Working.Entry[i].InUse == 0, or EEFS_NO_SPACE_LEFT_ON_DEVICE */
-int32   EEFS_NandAllocBlocks(Vol, uint32 Count, uint16 *Out, uint8 Owner);
-        /* first-fit over Working.Map[DirRegionBlocks..] for 0xFF; marks them Owner; forgets them in PendingCleanup. EEFS_NO_SPACE_LEFT_ON_DEVICE leaves the map untouched. */
+#define EEFS_NAND_ALLOC_NEW       0    /* new file, CopySlot: must leave >= EEFS_NAND_RESERVE_BLOCKS free */
+#define EEFS_NAND_ALLOC_MODIFY    1    /* copy-on-write modify, Rename, SetAttr: must leave >= EEFS_NAND_BADBLOCK_RESERVE free */
+#define EEFS_NAND_ALLOC_REPLACE   2    /* replacement for a grown bad block: may take the last free block */
+uint32  EEFS_NandFreeCount(Vol);                                             /* number of Working.Map bytes == FREE in [DirRegionBlocks, BlockCount) */
+int32   EEFS_NandAllocBlocks(Vol, uint32 Count, uint16 *Out, uint8 Owner, uint8 Class);
+        /* 6.9: fails with EEFS_NO_SPACE_LEFT_ON_DEVICE, leaving the map untouched, unless FreeCount - Count >= reserve(Class);
+           otherwise takes Count FREE blocks round-robin from Vol->AllocCursor, marks them Owner, forgets them in PendingCleanup,
+           and leaves AllocCursor after the last block taken. */
 void    EEFS_NandReleaseBlocks(Vol, const uint16 *Blocks, uint32 Count);   /* back to FREE (used when a write fails or a batch slot is dropped) */
 void    EEFS_NandFreeSlot(Vol, uint32 Entry, uint8 Slot);                   /* every Working.Map byte == OWNER(Entry,Slot) -> FREEING; adds FirstBlock to cleanup (caller checked room); zeroes the slot record */
+void    EEFS_NandFreeBlocksExcept(Vol, uint32 Entry, uint8 Slot, const uint16 *Keep, uint32 KeepCount);
+        /* every Working.Map byte == OWNER(Entry,Slot) whose block is not in Keep[] -> FREEING (copy-on-write, 6.3 step 7) */
 uint32  EEFS_NandBlocksNeeded(Vol, uint32 Size);                             /* max(1, ceil((PageSize+Size)/BlockBytes)) */
+boolean EEFS_NandBlockUnchanged(Vol, uint16 OldBlock, uint32 K, uint32 OldCrc, uint32 OldLen, const uint8 *NewSlice, uint32 NewLen);
+        /* 6.3 step 5: TRUE iff OldLen == NewLen, CRC32(NewSlice) == OldCrc and every byte of the old block's data pages for
+           position K (read uncached, page by page) equals NewSlice. Any read error -> FALSE. */
 int32   EEFS_NandValidateSlot(Vol, uint32 Entry, uint8 Slot, boolean Full);  /* page 0 (+ all block CRCs when Full); sets/clears SLOTFLAG_CORRUPT; SUCCESS / CORRUPT_FILE / IO_ERROR */
 int32   EEFS_NandWriteCopy(Vol, uint32 SrcEntry, uint8 SrcSlot, EEFS_NandPage0_t *NewP0, uint16 *DstBlocks);
         /* copies the data of (SrcEntry,SrcSlot) page by page into DstBlocks and writes NewP0 as page 0 of DstBlocks[0]; used by
@@ -767,18 +815,27 @@ int32   EEFS_NandReclaimOrphans(Vol);       /* 8.4 */
 ## 4. Block map and state model
 
 - `Working` is what every API call reads and modifies. `Base` is the committed state as last read
-  from or written to the media, with two exceptions that are facts about the media rather than
-  pending changes: in-place writes (6.2) and reconcile refreshes (5.2 step 6) update the slot's
-  copied fields in both `Base` and `Working` and set `ForceDirty[i]`.
+  from or written to the media, with one class of exception: facts the library *detects* about the
+  media rather than pending changes are recorded in both `Base` and `Working` with `ForceDirty[i]`
+  set, so that Abort keeps them and the next commit persists them. They are `ActiveFailed` set by
+  reconcile, Open, VerifyFile or the health check when the active copy fails validation, and the
+  copied-field repair of reconcile (5.2 step 6) when a valid page 0 disagrees with its entry.
+- **File content never changes in place.** Every rewrite of a slot allocates a new first block
+  and new blocks for the changed data (copy-on-write, 6.2), so `Base` always describes an intact
+  committed copy and the directory's copied fields are never stale in a committed state.
 - **Dirty set at commit** = entries where `memcmp(&Working.Entry[i], &Base.Entry[i])` differs,
   plus `ForceDirty`; map bytes where `Working.Map[b] != Base.Map[b]`.
 - **Bad blocks** are marked in `Working.Map` only (`0xFE`). Abort preserves them (5.5), so they are
   "sticky" and get persisted by the next commit through the normal diff.
-- **FREEING (`0xFC`)**: blocks released by Remove/Rename/SetAttr/relocation/CopySlot inside the
-  current batch. The allocator never hands them out. At commit they are serialized as `0xFF` and set
-  to `0xFF` in both states after the record is written. Abort returns them to their `Base` value.
-- A slot's first block always goes to the pending-cleanup list when the slot is freed, so a
-  committed removal is followed by an erase of its page 0.
+- **FREEING (`0xFC`)**: blocks released by Remove, Rename, SetAttr, CopySlot and copy-on-write
+  modifies inside the current batch. The allocator never hands them out. At commit they are
+  serialized as `0xFF` and set to `0xFF` in both states after the record is written. Abort returns
+  them to their `Base` value. FREEING is purely map state: a modify that replaces hundreds of data
+  blocks costs hundreds of map bytes and **one** cleanup-list entry.
+- The **pending-cleanup list holds first blocks only**: a slot's old first block goes on it whenever
+  the slot is removed or rewritten, so a committed removal or rewrite is followed by an erase of
+  the superseded page 0. Data blocks need no cleanup: they carry no page 0, and they are erased
+  when reallocated.
 - `VolumeChangeCounter` increments on every call that changes `Working`, `Base`, `SlotFlags`, the
   map or the media (WriteFile, Remove, Rename, SetFileAttributes, CopySlot(+All), SetActiveSlot(+All),
   SetFallbackCompatible(+All), SetFailed, ClearFailed, Commit, Abort, RepairDirectory,
@@ -843,12 +900,15 @@ PagesPerBlock + 2 x EEFS_MAX_FILES` pages.
    - Valid: for each `Blocks[k].Block = b`: if `Working.Map[b]` is FREE, FREEING, or
      `OWNER(i,s)`: set `Working.Map[b] = Base.Map[b] = OWNER(i,s)`; if it is another owner, DIR or
      BAD: `SlotFlags[i][s] |= CROSSLINK` (first claimant keeps the block; health reports it). Then
-     every map byte still equal to `OWNER(i,s)` that is not in `Blocks[]` becomes FREE (stale
-     allocation from an uncommitted relocation). If `BlockCount != AllocBlocks` or the copied
-     fields (`FileSize`, `Version`, `WriteSeq`, `FileCrc32`, `ModificationDate`) differ from the
-     entry: update them in `Working` and `Base` and set `ForceDirty[i]` (the next commit refreshes
-     the stale snapshot). Track `MaxPageWriteSeq`.
+     every map byte still equal to `OWNER(i,s)` that is not in `Blocks[]` becomes FREE (defensive:
+     a committed map and a committed page 0 should never disagree). If `BlockCount != AllocBlocks`
+     or the copied fields (`FileSize`, `Version`, `WriteSeq`, `FileCrc32`, `ModificationDate`)
+     differ from the entry (which, with copy-on-write, indicates a corrupted record rather than an
+     expected state): page 0 wins; update them in `Working` and `Base` and set `ForceDirty[i]` so
+     the next commit repairs the snapshot. Track `MaxPageWriteSeq`.
 7. `Base = Working` for everything not already mirrored (entries, map), `ForceDirty` as set above.
+   `AllocCursor` = the data block after the highest block whose map value is an owner (wrapping
+   to `DirRegionBlocks`); `DirRegionBlocks` when nothing is owned (6.9).
 8. `NextWriteSeq = max(Working.WriteSeqHigh, MaxPageWriteSeq) + 1 + EEFS_NAND_WRITESEQ_MOUNT_GAP`.
    The gap keeps a committed rewrite ahead of orphans that were assigned higher sequence numbers
    in an uncommitted batch before a power cut, so a rebuild prefers the committed copy (bounded
@@ -957,12 +1017,14 @@ mark is persisted by the next record or lost, in which case the block is simply 
 
 ```
 if any open descriptor refers to (i,s) whose Working slot differs from Base slot: return EEFS_DEVICE_IS_BUSY
-for each (i,s) with Working.Entry[i].Slot[s].InUse and Working FirstBlock != Base FirstBlock (slot created/relocated in the batch):
-    best effort: erase Working FirstBlock (its page 0 would otherwise be an orphan); failure -> MarkBad
+for each (i,s) with Working.Entry[i].Slot[s].InUse and Working FirstBlock != Base FirstBlock (slot created or rewritten in the batch):
+    best effort: erase Working FirstBlock only (its page 0 would otherwise be an orphan); failure -> MarkBad.
+    Never touch the other blocks of the slot: with copy-on-write they may be shared with the committed copy.
 for each b: if Working.Map[b] == BAD: keep; else Working.Map[b] = Base.Map[b]
 Working.Entry[] = Base.Entry[]; Working.WriteSeqHigh = Base.WriteSeqHigh
 PendingCleanupCount = count loaded at mount or left by the last commit that is still pending (i.e. remove entries added during the batch: the list is kept as [mount-pending | batch-added], tracked by PendingCleanupBase index)
-ForceDirty unchanged (in-place refreshes still need persisting)
+ForceDirty unchanged (detected media facts still need persisting, section 4)
+AllocCursor unchanged
 EEFS_NandTouch; return SUCCESS
 ```
 
@@ -995,14 +1057,31 @@ A stored path of 255 characters is the maximum (`strlen < EEFS_NAND_MAX_PATH_SIZ
 is not stored. Paths must begin with `/`; no other validation (the volume is flat: `/cf/apps/x.so`
 is one name and `/cf` is not a directory).
 
-### 6.2 In-place rule
+### 6.2 Copy-on-write rule (user decision, 2026-10-15)
 
-A write to a slot that is in use and needs `<= AllocBlocks` blocks reuses the same block list.
-The directory's `FirstBlock`/`AllocBlocks` do not change, so no commit is needed for the data to
-be the file's content. The write still refreshes `FileSize`, `Version`, `WriteSeq`, `FileCrc32`,
-`ModificationDate` in **both** `Base` and `Working` and sets `ForceDirty[i]`, so the next commit
-(whenever it happens) refreshes the snapshot. Until then the directory is stale for that slot; the
-health check reports it as `DIR_PAGE0_STALE` (informational).
+A slot's blocks are **never erased or programmed again while the slot is live**. Rewriting a slot
+that is in use:
+
+- writes a **new first block** always (its page 0 carries the new `WriteSeq`, `FileSize`, CRCs and
+  `Blocks[]`, so it can never be reused);
+- writes a fresh block for every data position `k >= 1` whose content changed, or which did not
+  exist before (growth);
+- **keeps** the old physical block, listed again at the same position, for every data position
+  whose content is unchanged (6.3 step 5 defines "unchanged" safely);
+- marks the old first block and every replaced or dropped old block FREEING, and puts the old
+  first block on the cleanup list.
+
+The slot's `FirstBlock` therefore changes on every rewrite, which **is a directory change**: it is
+staged in the pending batch and made live by the next `EEFS_Commit`. The user accepted this on
+2026-10-15; it supersedes the plan's "modifying a file does not update the directory". What it buys:
+a power cut at any point before the commit leaves the old copy intact and the new blocks free
+(the ordinary rollback path); a reader never sees a torn or mixed file; a failed rewrite never
+destroys the old data; and the per-rewrite cost is proportional to the amount of changed data plus
+one block, not to the file size.
+
+There is no fallback to an in-place write under any circumstance. If the free space (after the
+reserve rule, 6.9) does not cover the new first block plus the changed blocks, the call returns
+`EEFS_NO_SPACE_LEFT_ON_DEVICE` and changes nothing.
 
 ### 6.3 WriteFile (`EEFS_LibWriteFile`)
 
@@ -1013,42 +1092,59 @@ health check reports it as `DIR_PAGE0_STALE` (informational).
  3. Resolve entry i (FindEntry or AllocEntry) and slot s (6.1). Existing entry with READONLY attribute -> EEFS_PERMISSION_DENIED
     (write a new entry instead). Any open descriptor on (i, s) -> EEFS_PERMISSION_DENIED.
  4. Need = EEFS_NandBlocksNeeded(Size). Need > MaxBlocksPerFile or Size > max file size -> EEFS_NO_SPACE_LEFT_ON_DEVICE.
-    Mode = slot in use && Need <= AllocBlocks ? INPLACE : slot in use ? RELOCATE : NEW.
-    RELOCATE needs cleanup room for 1 block (EEFS_NandCleanupHasRoom) else EEFS_TRANSACTION_ERROR.
- 5. Block list:
-      INPLACE:  the slot's existing Blocks[] read from its page 0 (EEFS_NandReadPage0). If page 0 is unreadable/corrupt
-                (slot flagged CORRUPT), take the blocks from the map instead (all b with OWNER(i,s), ascending; FirstBlock first);
-                if that yields fewer than AllocBlocks blocks, fall back to RELOCATE. Count = AllocBlocks.
-      NEW/RELOCATE: Count = min(Need + EEFS_NAND_CREAT_SPARE_BLOCKS, MaxBlocksPerFile); EEFS_NandAllocBlocks(Count, OWNER(i,s))
-                -> EEFS_NO_SPACE_LEFT_ON_DEVICE (nothing changed yet; a fresh entry allocated in step 3 is simply left unused).
+    Mode = slot in use ? MODIFY : NEW. MODIFY needs cleanup room for 1 block (EEFS_NandCleanupHasRoom) else EEFS_TRANSACTION_ERROR.
+ 5. Build the position table Pos[0..Need-1], each {Block, Kept}:
+      NEW:    all positions new.
+      MODIFY: read the old page 0 (EEFS_NandReadPage0 of Slot[s].FirstBlock) -> OldCount, OldBlocks[], OldCrc[], OldSize.
+              If it is unreadable/corrupt (the slot is flagged CORRUPT): no position can be kept; all new.
+              Position 0 is always new. For k in 1 .. Need-1:
+                  if k < OldCount: (NewOff, NewLen) = EEFS_NandBlockDataRange(Size, k); OldLen = EEFS_NandBlockDataRange(OldSize, k);
+                      Kept = EEFS_NandBlockUnchanged(OldBlocks[k], k, OldCrc[k], OldLen, Data + NewOff, NewLen)
+                             (length equal, CRC equal, then a byte compare of the old block's data pages against Data; a CRC
+                             match alone is only probabilistic and a false "unchanged" would keep wrong data silently, so the
+                             compare is mandatory; a read error during the compare means "changed")
+                  else Kept = FALSE
+              Kept positions take Block = OldBlocks[k].
+      NewCount = number of positions with Kept == FALSE (>= 1).
+      EEFS_NandAllocBlocks(NewCount, NewList, OWNER(i,s), NEW ? ALLOC_NEW : ALLOC_MODIFY) -> EEFS_NO_SPACE_LEFT_ON_DEVICE
+          (nothing changed yet; a fresh entry allocated in step 3 is simply left unused). Assign NewList to the new positions in order.
  6. Attempt (repeat up to EEFS_NAND_WRITE_RETRIES times):
       P0: WriteSeq = NextWriteSeq++; Path; FileType, Slot = (IsAB ? s : NONE), Attributes, Version from Meta; FileSize = Size;
           FileCrc32 = CRC(Data, Size); CreationDate = existing entry's CreationDate or now; ModificationDate = now; Type = Meta->Type;
-          SigType = 0; BlockCount = Count. Block CRCs: for each k, EEFS_NandBlockDataRange -> CRC of that slice of Data.
-      Program order: k = 1 .. Count-1 then k = 0. For each k: EraseBlock(Blocks[k]); for each page that holds data
-          (k == 0: page 0 = encoded P0 built in PageBuf; data pages from page 1): build the page (memcpy the data slice, 0xFF tail)
-          in PageBuf and EEFS_NandProgramPageVerified. Pages beyond the data are not programmed.
-      On any erase/program/verify failure at block b = Blocks[k]:
-          EEFS_NandMarkBad(b)
-          INPLACE: the file's own block went bad: switch to RELOCATE: mark all remaining old blocks FREEING (FreeSlot semantics, incl. cleanup
-                   of the old FirstBlock, which is now erased or stale), allocate Count fresh blocks, restart the attempt.
-          NEW/RELOCATE: allocate one replacement FREE block for position k (EEFS_NO_SPACE_LEFT_ON_DEVICE -> fail), restart the attempt
-                   (Blocks[] changed, so P0 and all CRC positions are rebuilt; blocks already programmed are erased again as the
-                   attempt proceeds).
-      After the last retry fails: NEW/RELOCATE: ReleaseBlocks(new list), return EEFS_IO_ERROR (slot unchanged).
-          INPLACE-turned-RELOCATE: the old slot was already freed; the entry's slot becomes not-in-use in Working (the file is lost:
-          data was destroyed by the in-place erase); return EEFS_IO_ERROR.
+          SigType = 0; BlockCount = Need; Blocks[k] = Pos[k].Block; Crc[k] = CRC of the slice of Data for k (kept positions
+          reproduce OldCrc[k] by construction).
+      Program order: every NEW position k = 1 .. Need-1 ascending, then position 0. Kept positions are not touched at all.
+          For each new k: EraseBlock(Pos[k].Block); for each page that holds data (k == 0: page 0 = encoded P0 built in PageBuf;
+          data pages from page 1): build the page (memcpy the data slice, 0xFF tail) in PageBuf and EEFS_NandProgramPageVerified.
+          Pages beyond the data are not programmed.
+      On any erase/program/verify failure at a new block b = Pos[k].Block:
+          EEFS_NandMarkBad(b); allocate one replacement for position k with ALLOC_REPLACE (EEFS_NO_SPACE_LEFT_ON_DEVICE -> fail);
+          restart the attempt (Blocks[] changed, so P0 is rebuilt; new blocks already programmed are erased again as the attempt
+          proceeds; kept blocks are still never touched).
+      After the last retry fails (or no replacement block): ReleaseBlocks(all new blocks), return EEFS_IO_ERROR (or
+          EEFS_NO_SPACE_LEFT_ON_DEVICE). The slot is unchanged in every mode: the old copy was never written to.
  7. Success. Working.Entry[i]: InUse = 1, Path, FileType, Attributes, CreationDate (new entries), IsAB per 6.1.
-      Slot[s] = {InUse 1, FirstBlock = Blocks[0], AllocBlocks = Count, FileSize, Version, WriteSeq, FileCrc32, ModificationDate}.
-      RELOCATE: EEFS_NandFreeSlot(old blocks) *before* assigning the new slot record (FREEING + cleanup of old FirstBlock).
-      INPLACE: also copy the slot record into Base and set ForceDirty[i]. If s is the active slot and ActiveFailed was set, clear
-      ActiveFailed in Working (a rewrite repairs it). Clear SlotFlags[i][s].
+      MODIFY: EEFS_NandFreeBlocksExcept(i, s, kept blocks) (old first block and every replaced/dropped old block -> FREEING) and
+      EEFS_NandAddCleanup(old FirstBlock) *before* assigning the new slot record.
+      Slot[s] = {InUse 1, FirstBlock = Pos[0].Block, AllocBlocks = Need, FileSize, Version, WriteSeq, FileCrc32, ModificationDate}.
+      If s is the active slot and ActiveFailed was set, clear ActiveFailed in Working (a rewrite repairs it). Clear SlotFlags[i][s].
  8. EEFS_NandTouch. If EEFS_NAND_AUTO_COMMIT: EEFS_NandCommit. Return EEFS_SUCCESS.
 ```
 
-Power loss during step 6: NEW/RELOCATE -> directory unchanged, blocks free, possibly an orphan
-page 0 (block 0 is written last, so the orphan exists only if the data was complete). INPLACE ->
-page 0 of the slot is erased or stale relative to the data: `EEFS_CORRUPT_FILE` at Open/Verify.
+Cost of a MODIFY: one page read per page of every kept candidate (only positions whose length and
+CRC match are read), one erase + the data pages of every changed block, and one block for page 0.
+
+Power loss during step 6 (NEW or MODIFY): directory unchanged; the old copy, if any, is intact
+because none of its blocks was erased or programmed; the new blocks are free in the committed map;
+possibly an orphan page 0 (position 0 is written last, so the orphan exists only if the data was
+complete) that shares the kept blocks with the live copy, which a rebuild resolves by the overlap
+rule (8.1). Power loss after the commit but before the cleanup erase: the new copy is live and
+the old first block is on the pending cleanup list (5.6).
+
+A/B: writing the inactive slot is the same procedure; A and B never share blocks (CopySlot copies
+every block), so a modify of one slot cannot touch the other. Writing the active slot is equally
+safe (the old copy stays live until the commit), which removes the plan's warning about in-place
+writes to the active copy.
 
 The lock is held for the whole call (a 200 MB write blocks readers for its duration; see risks).
 
@@ -1056,8 +1152,12 @@ The lock is held for the whole call (a 200 MB write blocks readers for its durat
 
 `EEFS_LibOpen(T, Name, O_RDONLY, 0)`: resolve (6.1 / 7.3). `EEFS_NandValidateSlot(i, s, Full =
 EEFS_NAND_VERIFY_ON_OPEN)`: reads page 0 (`CORRUPT_FILE` on any FMT 3.4 failure, `Path` mismatch
-or explicit `Slot` mismatch) and, when `Full`, every data page accumulating the per-block CRCs and
-the file CRC (`CORRUPT_FILE` on mismatch, `IO_ERROR` on uncorrectable). Failure sets
+or explicit `Slot` mismatch) and, only when `Full`, every data page accumulating the per-block
+CRCs and the file CRC (`CORRUPT_FILE` on mismatch, `IO_ERROR` on uncorrectable). **By default
+(`EEFS_NAND_VERIFY_ON_OPEN = 0`, user decision 2026-10-15) Open checks page 0 only**; data CRCs are
+checked by the bootloader, `EEFS_LibVerifyFile` and the health check. With copy-on-write a live copy
+is never partially rewritten, so the open-time data check only guards against media decay, which
+the health check covers. Failure sets
 `SLOTFLAG_CORRUPT`; for the active slot of an `IsAB` entry also `ActiveFailed = 1` in `Working`
 and `Base` with `ForceDirty[i]`. Success clears `SLOTFLAG_CORRUPT`. The descriptor records
 `InodeIndex`, `Slot`, `Fallback`, `FirstBlock`, `FileSize` (from page 0), `CurK = none`.
@@ -1079,7 +1179,8 @@ Touch; AUTO_COMMIT.
 Only the **first block** of each in-use slot is rewritten: a new block receives the new page 0
 (new `Path` or `Attributes`) followed by verbatim copies of the old first block's data pages. Every
 other block of the file stays where it is and keeps its CRC. The cost is one block per slot instead
-of the whole file. They are transactional (nothing in `Base` changes).
+of the whole file. They are transactional (nothing in `Base` changes). This is the copy-on-write
+rule of 6.2 with every data position kept.
 
 ```
 Rename(Old, New): both parse with SlotSpec NONE (else INVALID_ARGUMENT); FindEntry(New) must fail (-> PERMISSION_DENIED, as EEPROM);
@@ -1089,7 +1190,7 @@ SetFileAttributes(Name, Attr): Attr in {NONE, READONLY} else INVALID_ARGUMENT; i
 Common:
     cleanup room for (slots in use); for each in-use slot s (A then B):
         read page 0 of the slot (CORRUPT_FILE aborts the whole operation with no change; blocks allocated so far are released)
-        allocate ONE block NB -> NO_SPACE_LEFT_ON_DEVICE (release an earlier slot's NB; no change)
+        allocate ONE block NB with ALLOC_MODIFY -> NO_SPACE_LEFT_ON_DEVICE (release an earlier slot's NB; no change)
         NewP0 = old P0 with Path/Attributes replaced, Blocks[0].Block = NB (Blocks[0].Crc and Blocks[1..] unchanged),
                 WriteSeq = NextWriteSeq++, ModificationDate unchanged (Rename) / now (SetAttr)
         erase NB; program NewP0 at page 0; copy pages 1..LastUsedPage(block 0) from the old first block (ReadPage -> ProgramPage);
@@ -1118,9 +1219,10 @@ BlockBytes`, `page = (r % BlockBytes) / PageSize`, `off = r % PageSize`. If `k !
 0 of `FirstBlock` (cached) and fetch `Blocks[k]` -> `CurBlock` (an invalid page 0 here returns
 `EEFS_CORRUPT_FILE`). Read `(CurBlock, page)` through the cache; copy `min(n, PageSize - off)`.
 Uncorrectable -> `EEFS_IO_ERROR` (bytes already copied are lost; the offset is not advanced).
-Returns bytes read. Opened descriptors keep working across a relocation of the same slot in the
-batch only because WriteFile refuses to write an open slot; Abort refuses while such descriptors
-exist (5.5).
+Returns bytes read. A descriptor is bound to the `FirstBlock` it was opened with; a copy-on-write
+rewrite of the same slot would strand it after the commit's cleanup erase, which is why WriteFile,
+Rename and SetFileAttributes refuse to touch an open slot, and Abort refuses while a descriptor on
+a batch-created copy exists (5.5).
 
 ### 6.8 VerifyFile and GetFileInfo
 
@@ -1129,6 +1231,44 @@ failure of the active slot set `ActiveFailed` (as 6.4). `EEFS_LibGetFileInfo`: f
 `Working` entry (both `SlotInfo[]`, with `Corrupt` from `SlotFlags`), then read page 0 of the
 resolved slot for `Type`, `FileSize`, `FileCrc32`, `Version` (page 0 wins over the entry when they
 differ); `CORRUPT_FILE` leaves `Type` zeroed and returns the code.
+
+### 6.9 Block allocation, the reserve pool and volume info (user decision, 2026-10-15)
+
+**Reserve.** A number of free blocks is held back so that an existing file can always be rewritten
+(copy-on-write needs new blocks even to change one byte) and a grown bad block can always be
+replaced, however full the volume is with new files. The reserve is a **count**, not a fixed set of
+blocks; which physical blocks are free changes all the time.
+
+| Allocation class | Used by | Allowed iff, after taking `Count` blocks, free blocks remaining `>=` |
+|---|---|---|
+| `EEFS_NAND_ALLOC_NEW` | WriteFile on a slot not in use (new file or new A/B copy), CopySlot | `EEFS_NAND_RESERVE_BLOCKS` (16) |
+| `EEFS_NAND_ALLOC_MODIFY` | WriteFile on a slot in use (6.3), Rename, SetFileAttributes (6.6) | `EEFS_NAND_BADBLOCK_RESERVE` (4) |
+| `EEFS_NAND_ALLOC_REPLACE` | replacement of a block that failed to erase/program/verify during any write (6.3, 7.5, 6.6) | 0 |
+
+"Free" means `Working.Map[b] == FREE` for `b >= DirRegionBlocks`; FREEING blocks do not count
+until the commit, so a batch that removes files does not gain space for itself until it commits
+(this keeps rollback safe). An allocation that would break its class's floor fails with
+`EEFS_NO_SPACE_LEFT_ON_DEVICE` before anything is written or changed. `EEFS_NAND_BADBLOCK_RESERVE
+<= EEFS_NAND_RESERVE_BLOCKS` is enforced at compile time. Both default to small numbers because
+the reserve is also unusable capacity; a volume with many large files that are rewritten often
+should raise `EEFS_NAND_RESERVE_BLOCKS` to the largest expected per-rewrite change plus one.
+
+**Round-robin cursor.** `EEFS_NandAllocBlocks` scans `Working.Map` from `Vol->AllocCursor` upward,
+wrapping from `BlockCount - 1` to `DirRegionBlocks`, taking FREE blocks in the order found until
+`Count` are taken; it then leaves `AllocCursor` just after the last block taken. A block freed by a
+rewrite is therefore not reused until the cursor has gone around the whole data area, which spreads
+erase cycles over every free block instead of hammering the lowest-numbered ones (first-fit would
+reuse the same handful of blocks for every small rewrite). The cursor lives in RAM only: at mount
+it is set to the block after the highest owned block (`DirRegionBlocks` if none), which resumes
+roughly where the previous session left off; after a reboot a different starting point costs
+nothing in correctness and only negligibly in wear balance, so persisting it (which would need a
+new VOLUME field, i.e. a format change) is not worth it. Format sets it to `DirRegionBlocks`.
+Abort leaves it where it is.
+
+**Volume info.** `EEFS_LibGetVolumeInfo` (2.6) reports the counts from `Working.Map` and the
+entry table without any NAND read, so housekeeping can show free space, the reserve levels and
+whether a batch is open. The health check adds `FREE_BELOW_RESERVE` (10.3) when the free count has
+fallen under `EEFS_NAND_RESERVE_BLOCKS`.
 
 ## 7. A/B
 
@@ -1174,7 +1314,7 @@ ParseName (NONE only); From != To, both in {A, B}; i = FindEntry; IsAB required.
     if !IsAB and From == A: allowed, sets IsAB = 1 on success)
 Slot[From].InUse else FILE_NOT_FOUND; descriptor open on (i, To) -> PERMISSION_DENIED; READONLY -> PERMISSION_DENIED
 RunPendingCleanup; cleanup room for 1 if Slot[To].InUse else TRANSACTION_ERROR
-read From's page 0 (CORRUPT_FILE -> return, no change); allocate AllocBlocks(From) blocks for OWNER(i, To) (NO_SPACE -> return)
+read From's page 0 (CORRUPT_FILE -> return, no change); allocate AllocBlocks(From) blocks for OWNER(i, To) with ALLOC_NEW (NO_SPACE -> return)
 NewP0 = From's P0 with Slot = To, WriteSeq = NextWriteSeq++; Blocks[] = new list; CRCs carried over
 EEFS_NandWriteCopy(i, From, NewP0, NewBlocks)  -> CORRUPT_FILE (source block CRC mismatch while copying: release, return) / IO_ERROR (release, return)
 if Slot[To].InUse: FreeSlot(i, To)
@@ -1193,8 +1333,8 @@ then 0, pages ascending). For each destination page: read the corresponding sour
 the cache (uncorrectable -> `EEFS_IO_ERROR`), accumulate the source block CRC, program the
 destination page with verify. After each source block, compare its CRC with the source page 0's
 `Blocks[k].Crc32` -> mismatch `EEFS_CORRUPT_FILE` (set source `SLOTFLAG_CORRUPT`). On a
-destination erase/program/verify failure: `MarkBad`, allocate one replacement FREE block for that
-position (`NO_SPACE` -> `EEFS_IO_ERROR`), rebuild `NewP0` (`Blocks[]` changed) and restart the
+destination erase/program/verify failure: `MarkBad`, allocate one replacement block for that
+position with `ALLOC_REPLACE` (`NO_SPACE` -> `EEFS_IO_ERROR`), rebuild `NewP0` (`Blocks[]` changed) and restart the
 copy, up to `EEFS_NAND_WRITE_RETRIES` times. The destination page 0 is encoded into `PageBuf` and
 written last. The copy goes page by page through the HAL; a BSP with a hardware block buffer may
 optimize inside its `ProgramPage`.
@@ -1211,7 +1351,8 @@ pass 1: for b in [DirRegionBlocks, BlockCount): if Working.Map[b] == BAD skip;
         MaxPageWriteSeq = max(...).
 pass 2: process the winners in DESCENDING WriteSeq order (overlap rule): read its page 0 again; if any of its Blocks[]
         is already OWNER of a winner processed earlier (higher WriteSeq), discard this winner entirely (orphan; this is the
-        superseded page 0 of a Rename/SetAttr first-block rewrite or of a relocation whose cleanup erase was cut).
+        superseded page 0 of a copy-on-write rewrite, Rename or SetAttr, which shares its kept data blocks with the newer
+        page 0, whose cleanup erase was cut; or the page 0 of an uncommitted rewrite that lost to the committed copy).
         Otherwise: Entry (row): InUse 1, Path, IsAB = any Explicit, FileType/Attributes/CreationDate from the active slot's P0
         (ActiveSlot = A present ? A : B), FallbackCompatible 0, ActiveFailed 0; Slot[s] = fields from P0; each Blocks[k] -> OWNER(row, s).
         A row whose winners were all discarded is dropped.
@@ -1307,12 +1448,13 @@ items are skipped by length. A checkpoint resets the candidate before its items 
 #define EEFS_HEALTH_AB_FALLBACK_UNAVAILABLE  25   /* informational */
 #define EEFS_HEALTH_AB_FAILED_FLAG_SET       26
 #define EEFS_HEALTH_AB_LOAD_MIXED            27   /* one finding; Path = first entry whose ActiveSlot differs from entry 0's (informational) */
-#define EEFS_HEALTH_DIR_PAGE0_MISMATCH       30   /* Path, Slot, Block: page 0 Path differs, or explicit Slot differs, or BlockCount != AllocBlocks */
-#define EEFS_HEALTH_DIR_PAGE0_STALE          31   /* Path, Slot, Block: Version/WriteSeq/FileSize/FileCrc32 differ (informational) */
+#define EEFS_HEALTH_DIR_PAGE0_MISMATCH       30   /* Path, Slot, Block, Aux0 = reason (1 Path, 2 Slot, 3 BlockCount, 4 copied fields): page 0 disagrees with the directory entry */
+/* 31 was DIR_PAGE0_STALE (removed with in-place modify; copied fields can no longer be legitimately stale, see 10.3). Do not reuse. */
 #define EEFS_HEALTH_MAP_MISMATCH             32   /* Block, Aux0 = map value, Aux1 = OWNER expected or 0xFFFF: map disagrees with the Blocks[] that claim/should claim it */
 #define EEFS_HEALTH_BLOCK_CROSSLINKED        33   /* Path, Slot (second claimant), Block, Aux0 = OWNER of the first claimant */
 #define EEFS_HEALTH_BADBLOCK_UNRECORDED      34   /* Block */
 #define EEFS_HEALTH_ORPHAN_FILE              35   /* Path (from page 0), Slot (page 0 Slot), Block, Aux0 = WriteSeq */
+#define EEFS_HEALTH_FREE_BELOW_RESERVE       40   /* Aux0 = free blocks, Aux1 = EEFS_NAND_RESERVE_BLOCKS; informational unless free < EEFS_NAND_BADBLOCK_RESERVE */
 
 /* Summary bits */
 #define EEFS_HEALTH_OK            0x00
@@ -1320,9 +1462,10 @@ items are skipped by length. A checkpoint resets the candidate before its items 
 #define EEFS_HEALTH_AB_ISSUE      0x02   /* codes 20-23, 26 */
 #define EEFS_HEALTH_DIR_ISSUE     0x04   /* codes 1-6, 30, 32-35 */
 #define EEFS_HEALTH_FILE_ISSUE    0x08   /* codes 10-12 */
-#define EEFS_HEALTH_INFO          0x10   /* codes 24, 25, 27, 31 */
+#define EEFS_HEALTH_INFO          0x10   /* codes 24, 25, 27, and 40 while free >= EEFS_NAND_BADBLOCK_RESERVE */
 #define EEFS_HEALTH_OVERFLOW      0x20   /* findings dropped */
 #define EEFS_HEALTH_INCOMPLETE    0x40   /* not finished (only in a snapshot taken before DONE) */
+#define EEFS_HEALTH_SPACE_ISSUE   0x80   /* code 40 present (with DEGRADED when free < EEFS_NAND_BADBLOCK_RESERVE) */
 
 typedef struct {
     uint16  Code;
@@ -1401,9 +1544,11 @@ not reported.)
 (`Working`): read page 0 of `FirstBlock`:
 - invalid -> `FILE_CORRUPT(Aux0 = 0)`, `SlotResult = 2` (or `3` and `FILE_IO_ERROR` on read
   failure); set `SLOTFLAG_CORRUPT`; next slot.
-- `Path` differs, or page `Slot` is explicit and differs, or `BlockCount != AllocBlocks` ->
-  `DIR_PAGE0_MISMATCH`, then continue checking the content anyway.
-- `Version`/`WriteSeq`/`FileSize`/`FileCrc32` differ from the entry -> `DIR_PAGE0_STALE`.
+- `Path` differs (`Aux0 = 1`), or page `Slot` is explicit and differs (`2`), or `BlockCount !=
+  AllocBlocks` (`3`), or `Version`/`WriteSeq`/`FileSize`/`FileCrc32`/`ModificationDate` differ from
+  the entry (`4`) -> `DIR_PAGE0_MISMATCH`, then continue checking the content anyway. (With
+  copy-on-write a committed entry always matches the page 0 it was committed with, so any of these
+  is a real inconsistency, not an expected transient; reconcile repairs reason 4 at the next mount.)
 - for each `Blocks[k]`: already in `Claimed` -> `BLOCK_CROSSLINKED` (Aux0 = `Working.Map[b]`);
   else set it; `Working.Map[b] != OWNER(i,s)` -> `MAP_MISMATCH(Aux1 = OWNER)`.
 - then for each `Blocks[k]`, each data page (page 0 is re-read at each block transition to fetch
@@ -1432,12 +1577,19 @@ DirRegionBlocks` or owner `>= 2 * EEFS_MAX_FILES` -> `MAP_MISMATCH` too. No read
 **Phase 4, scan.** Cursor `Block` from `DirRegionBlocks`. Read page 0 with OOB (uncached). Bad
 marker set and `Working.Map[b] != BAD` -> `BADBLOCK_UNRECORDED`. Valid metadata page (FMT 3.4,
 `ExpectBlock = b`), `Claimed` bit clear and `b` not on the pending cleanup list -> `ORPHAN_FILE`
-(a block awaiting its cleanup erase, such as the old first block after a Rename/SetAttr, is
-already reported by `DIR_CLEANUP_PENDING`). (Blocks owned by uncommitted batch
-slots have been claimed in phase 2 because phase 2 iterates `Working`, so an open batch does not
-produce false orphans.)
+(a block awaiting its cleanup erase, that is the old first block of any copy-on-write rewrite,
+modify, Rename or SetAttr, is already reported by `DIR_CLEANUP_PENDING`). Such a superseded page 0
+lists blocks that the live copy also lists; it is **not** reported as `BLOCK_CROSSLINKED` either:
+cross-links are detected only among the directory's own slots in phase 2. (Blocks owned by
+uncommitted batch slots have been claimed in phase 2 because phase 2 iterates `Working`, so an open
+batch does not produce false orphans; and a batch's rewritten slot shares its kept blocks with the
+committed copy that `Base` still names, which is likewise not a cross-link because phase 2 reads
+`Working` only.)
 
-**DONE.** `Summary` from the finding codes per the bit table.
+**DONE.** Space check (no reads): `Free = EEFS_NandFreeCount(T)`; `Free < EEFS_NAND_RESERVE_BLOCKS`
+-> `FREE_BELOW_RESERVE(Aux0 = Free, Aux1 = EEFS_NAND_RESERVE_BLOCKS)`, informational while `Free >=
+EEFS_NAND_BADBLOCK_RESERVE`, degraded below it. Then `Summary` from the finding codes per the bit
+table.
 
 Cost: phase 1 <= `DirRegionBlocks + 4 x PagesPerBlock`; phase 2 = every data page of every slot +
 `BlockCount` page-0 re-reads at most; phase 4 = `BlockCount - DirRegionBlocks`.
@@ -1591,10 +1743,25 @@ Implements: `eefs_nand_io.c` (3.1), `eefs_nand_journal.c` (3.2, 5.1-5.6), and in
 `eefs_nand_fileapi.c`: `EEFS_LibInitFS` (5.2 without step 5: no directory -> `EEFS_NOT_FORMATTED`
 for now, and step 6 reconcile limited to reading page 0s, since no files can exist yet; the step is
 coded but exercised in phase 3), `EEFS_LibFreeFS`, `EEFS_LibCommit`, `EEFS_LibAbort`,
-`EEFS_LibFormat`, `EEFS_LibRepairDirectory`, `EEFS_NandAllocBlocks/ReleaseBlocks/FreeSlot/
-AddCleanup/...` (3.3 allocation part), and the driver wrappers `EEFS_Format`, `EEFS_Commit`,
-`EEFS_Abort`, `EEFS_RepairDirectory`. Tests manipulate `Working` directly through
-`eefs_nand_internal.h` to simulate file operations (set entry fields, allocate blocks, write a
+`EEFS_LibFormat`, `EEFS_LibRepairDirectory`, the map/cleanup helpers `EEFS_NandFreeSlot`,
+`EEFS_NandFreeBlocksExcept`, `EEFS_NandReleaseBlocks`, `EEFS_NandAddCleanup`,
+`EEFS_NandCleanupHasRoom`, `EEFS_NandForgetCleanup`, `EEFS_NandTouch` (3.3, the parts that only
+touch the map and the cleanup list), and the driver wrappers `EEFS_Format`, `EEFS_Commit`,
+`EEFS_Abort`, `EEFS_RepairDirectory`. **Not** in phase 2: the allocator (`EEFS_NandAllocBlocks`,
+`EEFS_NandFreeCount`, the reserve rule and `AllocCursor` seeding, 6.9) and everything else in 3.3,
+which are phase 3; phase 2 tests set `Working.Map` bytes directly to simulate allocations. Phase 2
+also does the header housekeeping that the 2026-10-15 decisions require, none of which changes
+journal logic: in `inc/eefs_config.h` set `EEFS_NAND_VERIFY_ON_OPEN` to 0, add
+`EEFS_NAND_RESERVE_BLOCKS` and `EEFS_NAND_BADBLOCK_RESERVE` with their compile check, remove
+`EEFS_NAND_CREAT_SPARE_BLOCKS`; in `inc/eefs_nand_types.h` remove `EEFS_HEALTH_DIR_PAGE0_STALE`
+(leave the comment that 31 is retired), add `EEFS_HEALTH_FREE_BELOW_RESERVE` 40 and
+`EEFS_HEALTH_SPACE_ISSUE 0x80`, fix the INFO/`DIR_PAGE0_MISMATCH` comments, add `AllocCursor` to
+`EEFS_InodeTable_t`; in `inc/eefs_nand.h` add `EEFS_NandVolumeInfo_t` and `EEFS_LibGetVolumeInfo`
+(a stub until phase 3) and in `eefs_filesys.[ch]` the `EEFS_GetVolumeInfo` wrapper; in
+`eefs_nand_internal.h` the `EEFS_NAND_ALLOC_*` constants, the new `EEFS_NandAllocBlocks` signature
+(`Class` parameter), `EEFS_NandFreeCount`, `EEFS_NandFreeBlocksExcept` and `EEFS_NandBlockUnchanged`.
+`test_layout.c` must keep passing (none of this is on-media). Tests manipulate `Working` directly
+through `eefs_nand_internal.h` to simulate file operations (set entry fields and map bytes, write a
 fake but valid page 0 with the encoders).
 
 Tests (suite `journal`): `format_rejects_512_page`, `format_rejects_bad_geometry` (odd dir blocks,
@@ -1615,7 +1782,10 @@ each ring gets erased; mount after each 50 commits agrees with RAM), `mirror0_er
 `Seq-1`; the next commit writes a CHECKPOINT in the next ring block), `torn_entry_checkpoint_falls_back_to_previous_block`,
 `dir_block_program_failure_marks_bad_and_retries` (map shows `0xFE` after the commit, ring shrinks),
 `pending_cleanup_rerun_before_first_mutating_op` (cut during cleanup; remount; `PendingCleanupBase > 0`;
-a Commit erases them; and separately an allocation of such a block forgets it),
+a Commit erases them; the "an allocation of such a block forgets it" half moves to phase 3 with the
+allocator), `freeing_is_map_state_only` (free 300 blocks of several synthetic slots in one batch:
+the cleanup list grows by the number of slots, the TXN carries the map ranges, and the remount
+agrees),
 `writeseq_gap_after_mount`, `powercut_sweep_commit` (sweep every budget value through a 3-entry
 commit for all torn modes: after reboot+mount the state equals exactly pre or post; mount never
 programs/erases; a following commit succeeds and both mirrors agree).
@@ -1624,43 +1794,80 @@ Done when: `nand_journal_*` passes for all three geometries; `eeprom` tests stil
 
 ### Phase 3: file operations
 
-Implements: section 6 in `eefs_nand_fileapi.c` (WriteFile, Open/Close/Read/LSeek, Stat/Fstat,
-OpenDir/ReadDir/CloseDir, Remove, Rename, SetFileAttributes, VerifyFile, GetFileInfo, ChkDsk,
-`EEFS_NandWriteCopy`, `EEFS_NandValidateSlot`, name parsing with suffix parsing present but A/B
-behaviour limited to "explicit slot works, no fallback" until phase 5), mount reconcile (5.2 step
-6) exercised, and the driver wrappers `EEFS_WriteFile`, `EEFS_VerifyFile`, `EEFS_GetFileInfo`,
-`EEFS_UnMount` commit. The default-config executable `eefs_nand_test_default` is registered.
+Implements: section 6 in `eefs_nand_fileapi.c` (the allocator with the reserve rule and the
+round-robin cursor, 6.9; WriteFile with copy-on-write, 6.2/6.3; Open/Close/Read/LSeek, Stat/Fstat,
+OpenDir/ReadDir/CloseDir, Remove, Rename, SetFileAttributes, VerifyFile, GetFileInfo,
+GetVolumeInfo, ChkDsk, `EEFS_NandWriteCopy`, `EEFS_NandValidateSlot`, `EEFS_NandBlockUnchanged`,
+name parsing with suffix parsing present but A/B behaviour limited to "explicit slot works, no
+fallback" until phase 5), mount reconcile (5.2 step 6) and `AllocCursor` seeding exercised, and the
+driver wrappers `EEFS_WriteFile`, `EEFS_VerifyFile`, `EEFS_GetFileInfo`, `EEFS_GetVolumeInfo`,
+`EEFS_UnMount` commit. The executables `eefs_nand_test_default` and `eefs_nand_test_verifyopen` are
+registered (1.2).
 
 Tests (suite `fileops`): `write_read_sizes` (0, 1, `PageSize-1`, `PageSize`, exactly `D0`,
 `D0+1`, 3 blocks + 17 bytes: content, Stat size, pages programmed = expected, pages after data
 erased), `write_all_types_roundtrip_via_getfileinfo`, `path_255_ok_256_rejected`, `name_rules`
-(no leading `/`, second `@`, `@C`), `signature_block_present_and_excluded`, `inplace_modify_no_dir_change`
-(`Programs` of the dir region unchanged, `ForceDirty` set, next commit refreshes `WriteSeq`),
-`shrink_in_place_and_grow_relocates` (old blocks FREEING until commit, cleanup erases old page 0),
-`remove_then_commit_erases_page0`, `rename_rewrites_first_block_only` (only one new block programmed; `Blocks[1..]` unchanged; old first block erased by cleanup), `setattr_rewrites_first_block_and_readonly_rules`,
-`open_write_flags_unsupported` (`O_WRONLY`, `O_RDWR`, `O_CREAT`, `Creat`, `Write`),
-`read_lseek_across_blocks`, `batch_20_files_one_commit_one_record` (dir `Programs` before commit
-= 0; after = pages of one record x 2 mirrors; all visible), `reboot_before_commit_rolls_back`,
-`abort_frees_space_and_reusable`, `freed_blocks_not_reused_before_commit` (remove + write a new
-file of the same size: different blocks), `uncorrectable_read_gives_io_error` (inject an
-uncorrectable read on a data page: Open returns `EEFS_IO_ERROR` because of the open-time
-verification; inject it with `Times = 1` after a successful Open so that `Read` returns
-`EEFS_IO_ERROR`), `grown_bad_block_recovered`
-(program fail on a data block during NEW: file complete, `0xFE` in map, OOB marker set; during
-INPLACE: file relocated, entry dirty), `write_retries_exhausted_io_error`, `verify_file_detects_corruption`,
-`stat_readdir_full_paths`, `split_path_driver` (`"/NAND0/cf/apps/x.so"` -> `/NAND0` + `/cf/apps/x.so`;
-too long rejected), `max_file_size_rejected`, `reconcile_page0_wins_block_ownership` (write a file,
-relocate it in a batch, cut power, remount: the uncommitted copy's blocks are FREE and the old
-blocks are owned per page 0; the stale snapshot fields are refreshed and `ForceDirty` set).
-Suite `powercut`: `powercut_sweep_write_new` and `powercut_sweep_relocate` (after every cut and
-remount the directory is unchanged and the old content, if any, reads back intact),
-`powercut_sweep_inplace` (after every cut: Open either succeeds and reads exactly the new content,
-or returns `EEFS_CORRUPT_FILE`; the old or a mixed content is never returned),
-`powercut_sweep_remove_rename_setattr`,
-`powercut_sweep_batch_and_cleanup` (5 files written, 2 removed, 1 renamed, then Commit; after each
-cut the directory is exactly pre or post; if post, pending cleanup is finished by the next commit).
+(no leading `/`, second `@`, `@C`), `signature_block_present_and_excluded`,
+`cow_modify_keeps_unchanged_blocks` (write a 6-block file; rewrite it with bytes changed only in
+position 3: exactly two blocks are erased and programmed, the new first block and position 3's
+replacement; positions 1, 2, 4, 5 keep their physical blocks and CRCs in the new page 0; the old
+first block and the old position-3 block are FREEING; the cleanup list grew by exactly one; the
+dir region saw no program; after Commit the old first block is erased and the two replaced blocks
+are FREE), `cow_modify_byte_compare_reads_kept_blocks` (`Reads` grows by the data pages of every
+kept position, proving the byte compare runs even though the CRCs matched), `cow_modify_changed_crc_skips_compare`
+(a position whose CRC differs is not read), `cow_modify_grow_and_shrink` (grow: new positions
+appended, all old kept where unchanged; shrink: dropped old blocks FREEING, the shortened last
+position rewritten because its length differs), `cow_modify_of_corrupt_slot_rewrites_all` (page 0
+of the slot destroyed: nothing kept, the slot is repaired by the rewrite), `cow_modify_no_space_no_change`
+(fill the volume until `FreeBlocks == EEFS_NAND_BADBLOCK_RESERVE + 1`; a modify that needs 2 new
+blocks returns `EEFS_NO_SPACE_LEFT_ON_DEVICE`; `Programs`, `Erases`, the directory and the map are
+unchanged; a modify needing 1 block succeeds), `reserve_new_file_vs_modify` (with
+`FreeBlocks == EEFS_NAND_RESERVE_BLOCKS + 2`: a 3-block new file fails with `NO_SPACE`, a 3-block
+modify of an existing file succeeds; then with `FreeBlocks == EEFS_NAND_BADBLOCK_RESERVE`: a 1-block
+modify fails), `reserve_badblock_replacement_may_use_everything` (`FreeBlocks ==
+EEFS_NAND_BADBLOCK_RESERVE`, inject a program failure during a modify that was allowed with
+`FreeBlocks == EEFS_NAND_BADBLOCK_RESERVE + 1`: the replacement succeeds and the file is complete),
+`freeing_not_counted_as_free_until_commit` (remove a file, then a new file of that size fails with
+`NO_SPACE`; after Commit it succeeds), `allocator_round_robin` (consecutive allocations advance
+through the data area; a block freed and committed is not reused until the cursor wraps; after
+remount the cursor starts after the highest owned block; `GetVolumeInfo` counts match the map),
+`get_volume_info_counts` (free/freeing/used/bad/available/files/slots/uncommitted before and after
+writes, removes and Commit), `remove_then_commit_erases_page0`, `rename_rewrites_first_block_only`
+(only one new block programmed; `Blocks[1..]` unchanged; old first block erased by cleanup),
+`setattr_rewrites_first_block_and_readonly_rules`, `open_write_flags_unsupported` (`O_WRONLY`,
+`O_RDWR`, `O_CREAT`, `Creat`, `Write`), `read_lseek_across_blocks`, `batch_20_files_one_commit_one_record`
+(dir `Programs` before commit = 0; after = pages of one record x 2 mirrors; all visible),
+`reboot_before_commit_rolls_back`, `abort_frees_space_and_reusable` (Abort erases only the new
+first blocks of the batch, never a kept block: the old copies read back intact),
+`freed_blocks_not_reused_before_commit` (remove + write a new file of the same size: different
+blocks), `uncorrectable_read_gives_io_error` (inject an uncorrectable read on a data page after a
+successful Open: `Read` returns `EEFS_IO_ERROR`; `VerifyFile` returns `EEFS_IO_ERROR`),
+`open_checks_page0_only_by_default` (`#if !EEFS_NAND_VERIFY_ON_OPEN`: corrupt a data page; Open
+succeeds, `Reads` during Open = 1, `VerifyFile` reports `CORRUPT_FILE`) and
+`open_verifies_data_when_enabled` (`#if EEFS_NAND_VERIFY_ON_OPEN`: the same corruption makes Open
+return `EEFS_CORRUPT_FILE` and set `SLOTFLAG_CORRUPT`; run by `nand_verify_on_open_4096`),
+`grown_bad_block_recovered` (program fail on a new data block during NEW and during a MODIFY: file
+complete, `0xFE` in map, OOB marker set; in the MODIFY case the kept blocks were never erased),
+`write_retries_exhausted_io_error` (NEW and MODIFY: the old copy is intact and still the slot's
+content after the failure), `verify_file_detects_corruption`, `stat_readdir_full_paths`,
+`split_path_driver` (`"/NAND0/cf/apps/x.so"` -> `/NAND0` + `/cf/apps/x.so`; too long rejected),
+`max_file_size_rejected`, `reconcile_page0_wins_block_ownership` (write a file and Commit; rewrite
+it in a batch with one block changed; cut power before Commit; remount: the directory still names
+the old first block, the new first block and the replaced block are FREE, the kept blocks are
+owned by the old copy per its page 0, and the old content reads back), `pending_cleanup_block_forgotten_on_alloc`
+(the half moved here from phase 2).
+Suite `powercut`: `powercut_sweep_write_new` (after every cut and remount the directory is
+unchanged and nothing is owned by the new file), `powercut_sweep_modify` (6-block file, rewrite
+with two positions changed; after every cut and remount, Open succeeds and reads **either exactly
+the old or exactly the new content**, never `EEFS_CORRUPT_FILE`, never a mix; which one is "old"
+iff the cut came before the commit record completed; if "new", the pending cleanup is finished by
+the next commit and the old first block is erased), `powercut_sweep_remove_rename_setattr`,
+`powercut_sweep_batch_and_cleanup` (5 files written, 2 removed, 1 renamed, 1 modified, then
+Commit; after each cut the directory is exactly pre or post; if post, pending cleanup is finished
+by the next commit).
 
-Done when: `nand_fileops_*`, `nand_powercut_*`, `nand_default_config_4096` pass; `eeprom` unchanged.
+Done when: `nand_fileops_*`, `nand_powercut_*`, `nand_default_config_4096`,
+`nand_verify_on_open_4096` pass; `eeprom` unchanged.
 
 ### Phase 4: rebuild
 
@@ -1698,9 +1905,12 @@ persisted by the next commit), `ab_active_corrupt_not_compatible_fails` (`EEFS_C
 `ab_explicit_name_never_falls_back`, `ab_setfailed_persists_and_clears` (remount keeps it; rewrite
 of the active slot clears; CopySlot into active clears; SetActiveSlot clears),
 `ab_remove_slot_rules`, `ab_copyslot_all_stops_at_first_error`, `ab_single_copy_opt_in_via_copyslot`,
-`ab_inplace_write_inactive_slot_leaves_active_untouched`, `ab_rebuild_recovers_locations_versions`.
+`ab_modify_inactive_slot_leaves_active_untouched` (copy-on-write rewrite of B keeps B's unchanged
+blocks and never touches any block of A; A's content and page 0 are byte-identical before and
+after), `ab_modify_active_slot_is_safe` (rewrite the active slot in a batch, cut power before
+Commit: the old active copy is intact and loads), `ab_rebuild_recovers_locations_versions`.
 
-Done when: `nand_ab_*` passes.
+Done when: `nand_ab_*` and `nand_verify_on_open_ab_4096` pass.
 
 ### Phase 6: health check and ReclaimOrphans
 
@@ -1716,8 +1926,13 @@ and asserting code, `EntryIndex`, `Path`, `Slot`, `Block` (and `Aux` where defin
 `health_file_io_error`, `health_block_needs_scrub`, `health_ab_a_corrupt`, `health_ab_b_corrupt`,
 `health_ab_active_corrupt_sets_flag`, `health_ab_active_missing`, `health_ab_version_mismatch`,
 `health_ab_fallback_unavailable`, `health_ab_failed_flag_set`, `health_ab_load_mixed`,
-`health_dir_page0_mismatch`, `health_dir_page0_stale`, `health_map_mismatch`,
-`health_block_crosslinked`, `health_badblock_unrecorded`, `health_orphan_file`; plus
+`health_dir_page0_mismatch` (one sub-case per `Aux0` reason 1-4), `health_map_mismatch`,
+`health_block_crosslinked`, `health_badblock_unrecorded`, `health_orphan_file`,
+`health_free_below_reserve` (informational at `BADBLOCK_RESERVE <= free < RESERVE_BLOCKS`,
+degraded below `BADBLOCK_RESERVE`, absent at `free == RESERVE_BLOCKS`),
+`health_cow_superseded_page0_not_orphan_or_crosslink` (modify + Commit with the cleanup erase cut:
+the old first block yields `DIR_CLEANUP_PENDING` only; after `RunPendingCleanup` the report is
+clean); plus
 `health_maxpagereads_1_equals_one_big_step` (identical finding lists and counters except `Steps`),
 `health_restart_on_commit_during_check` (`Restarts == 1`, report correct), `health_open_batch_no_false_orphans`,
 `health_powercut_sweep_never_crashes_and_matches_expectation` (after each cut of the batch sweep,
@@ -1791,24 +2006,27 @@ for both backends.
    copy. In that case the A/B compatible-fallback rule applies instead.
 7. **Health check restarts from phase 1** on any volume change, clearing findings, rather than
    restarting "the affected phase"; `VolumeChangeCounter` increments on every mutating call, not
-   only commits and in-place writes. Simpler and always correct.
-8. **Added:** `EEFS_GEOMETRY_MISMATCH` (-15); finding `DIR_PAGE0_STALE` (informational, for the
-   expected stale snapshot after an in-place write); config macros `EEFS_NAND_VERIFY_ON_OPEN`,
-   `EEFS_NAND_WRITESEQ_MOUNT_GAP`, `EEFS_NAND_MAX_DIR_BLOCKS`, `EEFS_NAND_LAYOUT_VERSION`,
-   `EEFS_NAND_HEALTH_PATH_SIZE`, `EEFS_NAND_WRITE_RETRIES`; API `EEFS_LibHealthCheckCancel`,
-   `EEFS_LibSetFallbackCompatibleAll`, `EEFS_LibRebuildDirectory` as a public call.
-9. **Open verifies the whole file by default** (`EEFS_NAND_VERIFY_ON_OPEN = 1`). Page-0-only
-   validation cannot detect an in-place write interrupted after block 0 was rewritten but before
-   the other blocks were, so "never wrong data" needs the block CRCs. The cost is one read of the
-   file at open; bootloaders read everything anyway.
-10. **Write order: blocks 1..n-1 first, block 0 (with page 0) last**, so an interrupted new write
-    leaves no page 0 (no orphan) unless the data was complete.
+   only commits. Simpler and always correct.
+8. **Added:** `EEFS_GEOMETRY_MISMATCH` (-15); finding `FREE_BELOW_RESERVE` (40) and summary bit
+   `SPACE_ISSUE`; config macros `EEFS_NAND_VERIFY_ON_OPEN`, `EEFS_NAND_RESERVE_BLOCKS`,
+   `EEFS_NAND_BADBLOCK_RESERVE`, `EEFS_NAND_WRITESEQ_MOUNT_GAP`, `EEFS_NAND_MAX_DIR_BLOCKS`,
+   `EEFS_NAND_LAYOUT_VERSION`, `EEFS_NAND_HEALTH_PATH_SIZE`, `EEFS_NAND_WRITE_RETRIES`; API
+   `EEFS_LibHealthCheckCancel`, `EEFS_LibSetFallbackCompatibleAll`, `EEFS_LibRebuildDirectory` as a
+   public call, `EEFS_LibGetVolumeInfo`. Finding 31 (`DIR_PAGE0_STALE`) existed in the first
+   revision of this spec and in the phase 1 header and is retired (see 24).
+9. **Open checks page 0 only by default** (`EEFS_NAND_VERIFY_ON_OPEN = 0`, user decision
+   2026-10-15). The first revision defaulted to a full CRC check at open to catch an interrupted
+   in-place write; with copy-on-write (24) a live copy is never partially rewritten, so the data
+   CRCs are left to the bootloader, `VerifyFile` and the health check. The option stays and is
+   built and tested with it on (`nand_verify_on_open_4096`).
+10. **Write order: new blocks 1..n-1 first, the new first block (with page 0) last**, so an
+    interrupted write leaves no page 0 (no orphan) unless the data was complete.
 11. **Page-0 `Slot` is A / B / NONE (0xFF)** and the directory's `IsAB` is set when a slot was
     ever written explicitly; rebuild sets `ActiveSlot = A if present else B` (the plan said
     always A, which would make a B-only file unopenable after a rebuild).
 12. **The directory entry caches `FileSize`, `FileCrc32`, `ModificationDate` per slot**, so Stat
-    and ReadDir need no NAND reads. These can be stale after an in-place write until the next
-    commit (reported as informational).
+    and ReadDir need no NAND reads. With copy-on-write they are never legitimately stale in a
+    committed state; a difference is reported as `DIR_PAGE0_MISMATCH` and repaired by reconcile.
 13. **Checkpoints carry only in-use entries**; absence means not in use.
 14. **Abort erases the first block of every slot the batch created** (best effort) so aborted
     batches leave no orphans for a rebuild to pick up; the plan left them to be erased on reuse.
@@ -1823,14 +2041,43 @@ for both backends.
 18. **`EEFS_LibReclaimOrphans` scans the device itself** rather than consuming a health report
     (which could be stale) and never touches owned or FREEING blocks.
 19. **RAM budget** is ~62 KB per volume (two copies of the entry table for Abort, two page buffers,
-    the cached health summary), not the ~15 KB the plan estimated.
+    the cached health summary), not the ~15 KB the plan estimated. Accepted by the user on
+    2026-10-15.
 20. **The BSP slot hook is a function pointer set at run time** (`MicroEEFS_NandSetSlotHook`), not a
     link-time override, since C89 has no portable weak symbols.
 21. **`EEFS_SetFallbackCompatible` "name or all"** is two functions (`...` and `...All`), and the
     `All` variants return counts.
-22. **Mount reconcile refreshes stale slot snapshots** (`ForceDirty`) from page 0 and sets
+22. **Mount reconcile repairs disagreeing slot snapshots** (`ForceDirty`) from page 0 and sets
     `ActiveFailed` for an invalid active copy, so the first commit after a crash repairs the
-    directory's copied fields; the plan only mentioned reporting `EEFS_CORRUPT_FILE`.
+    directory; the plan only mentioned reporting `EEFS_CORRUPT_FILE`.
+
+Decisions of 2026-10-15 (user), superseding earlier text of this spec and of the plan:
+
+23. **Reserved spare pool and round-robin allocation** (6.9). `EEFS_NAND_RESERVE_BLOCKS` (16) free
+    blocks are held back from new-file and CopySlot allocations; rewrites of existing files
+    (copy-on-write modify, Rename, SetAttr) may use them down to `EEFS_NAND_BADBLOCK_RESERVE` (4);
+    grown-bad-block replacement may take the last block. The allocator is round-robin from a RAM
+    cursor rather than first-fit, so erase cycles spread over all free blocks. The cursor is not
+    persisted (a reboot only moves the starting point; persisting it would need a format change).
+    `EEFS_LibGetVolumeInfo` and the `FREE_BELOW_RESERVE` finding report the levels.
+24. **Copy-on-write replaces in-place modify entirely** (6.2, 6.3). The plan said "modifying a file
+    does not update the directory" and the first revision of this spec implemented that as an
+    in-place erase-and-rewrite of the slot's blocks, which left a torn file (`EEFS_CORRUPT_FILE`)
+    on power loss and destroyed the old data on a write failure. Now every rewrite writes a new
+    first block plus fresh blocks for the changed data, keeps unchanged blocks (same length, CRC
+    match, and a byte compare against the old block, because a CRC match alone is probabilistic),
+    and changes `FirstBlock`, which **is a directory change** staged in the batch and made live by
+    `EEFS_Commit`. The user accepted this consequence. Power loss before the commit leaves the old
+    copy; there is no fallback to an in-place write, and insufficient space (after the reserve
+    rule) is `EEFS_NO_SPACE_LEFT_ON_DEVICE` with no change. The A/B inactive-slot upload is the
+    same path. Removed with it: `EEFS_NAND_CREAT_SPARE_BLOCKS`, finding `DIR_PAGE0_STALE`, the
+    in-place tests and the `EEFS_CORRUPT_FILE`-after-cut expectation.
+25. **No per-block "next block" header.** The user floated a next-block pointer in the first page
+    of each block. It was not adopted: page 0's `Blocks[]` already lets a rewrite touch only the
+    changed blocks plus the first block, whereas a pointer in each block would have to be rewritten
+    in every block that precedes a changed one (the rewrite cascades back to the start), and data
+    blocks would lose a page each. The format keeps `Blocks[]` and header-less data blocks (FMT 3.3).
+26. **`EEFS_NAND_VERIFY_ON_OPEN` defaults to 0** (see 9) and the **RAM budget is accepted** (see 19).
 
 ## 16. Open risks and questions
 
@@ -1838,10 +2085,13 @@ for both backends.
   library lock for their whole duration (hundreds of ms to seconds for large files), blocking all
   readers on every volume. Acceptable for an infrequently written boot volume; otherwise a future
   change could release the lock between blocks (the batch model already tolerates it).
-- **Whole file in RAM.** `EEFS_LibWriteFile` takes the complete file in memory. A callback or
-  chunked variant can be added later without format change.
-- **Rename/SetAttr** rewrite only the first block (decided 2026-10-15), so a READONLY toggle on a
-  large file costs one block copy, not a full copy.
+- **Whole file in RAM.** `EEFS_LibWriteFile` takes the complete file in memory (copy-on-write
+  compares the new data against the old blocks, so it also needs the whole new image at once). A
+  callback or chunked variant can be added later without format change.
+- **Reserve sizing.** `EEFS_NAND_RESERVE_BLOCKS` = 16 guarantees a rewrite only if at most 15 data
+  blocks (7.5 MB at the target geometry) change while the volume is otherwise full of new files.
+  Deployments that rewrite large images on a nearly full volume should raise it; `GetVolumeInfo`
+  and `FREE_BELOW_RESERVE` make the margin visible.
 - **NAND assumptions:** pages programmed once between erases, in ascending order; an erased page
   reads `0xFF` with status >= 0; the OOB byte at `BadMarkerOffset` is programmable independently of
   the controller's ECC bytes. Controllers whose ECC covers the OOB marker byte may reject the
@@ -1849,7 +2099,8 @@ for both backends.
 - **`EEFS_UnMount` commits implicitly** (plan). An application that wanted to drop a batch must
   call `EEFS_Abort` first.
 - **Rebuild caveats** (FMT 6) are inherent; `WRITESEQ_MOUNT_GAP` and Abort-time erasure reduce
-  but do not eliminate them.
-- **RAM:** ~124 KB static for two devices at the defaults. Reduce `EEFS_MAX_FILES` or
-  `EEFS_NAND_MAX_PATH_SIZE` if the target cannot afford it.
+  but do not eliminate them. With copy-on-write an uncommitted rewrite's page 0 shares blocks with
+  the committed copy; the overlap rule (8.1) makes the higher `WriteSeq` win, which after a crash
+  before commit is the *uncommitted* copy when both are complete (the same documented caveat as
+  for a new file in an uncommitted batch).
 - **Signature scheme** left for the future; version 1 readers reject `SigType != 0`.
