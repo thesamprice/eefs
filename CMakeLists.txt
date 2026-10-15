@@ -22,6 +22,19 @@ option(EEFS_BUILD_TOOLS     "Build the host tools (geneepromfs, eefstool-img)" $
 option(EEFS_BUILD_BDM_TOOL  "Build eefstool-bdm (needs the RTEMS 4.10 BDM headers and libraries)" OFF)
 option(EEFS_WERROR          "Treat warnings as errors where the original Makefiles did (geneepromfs)" ON)
 
+# Storage backend.  eeprom is the original memory-mapped slot file system; nand is the raw NAND backend
+# (docs/nand-format.md, docs/nand-implementation.md).
+set(EEFS_BACKEND "eeprom" CACHE STRING "EEFS storage backend: eeprom or nand")
+set_property(CACHE EEFS_BACKEND PROPERTY STRINGS eeprom nand)
+if(NOT EEFS_BACKEND MATCHES "^(eeprom|nand)$")
+    message(FATAL_ERROR "Unknown EEFS_BACKEND '${EEFS_BACKEND}' (expected eeprom or nand)")
+endif()
+if(EEFS_BACKEND STREQUAL "nand" AND EEFS_BUILD_TOOLS)
+    # geneepromfs and eefstool build and read EEPROM images only
+    message(STATUS "EEFS_BACKEND=nand: the EEPROM host tools are not built (EEFS_BUILD_TOOLS forced OFF)")
+    set(EEFS_BUILD_TOOLS OFF)
+endif()
+
 # Optional processor define for common_types.h (_ix86_, __PPC__, _m68k_ or __SPARC__).  Leave it
 # empty for everything else (ARM, AArch64, RISC-V, MicroBlaze, host builds): common_types.h then
 # takes the endianness from the compiler.
@@ -57,6 +70,9 @@ target_include_directories(eefs_headers INTERFACE
 if(EEFS_ARCH_DEFINE)
     target_compile_definitions(eefs_headers INTERFACE ${EEFS_ARCH_DEFINE})
 endif()
+if(EEFS_BACKEND STREQUAL "nand")
+    target_compile_definitions(eefs_headers INTERFACE EEFS_BACKEND_NAND)
+endif()
 
 #
 # eefs: the core file system library plus the selected OS driver
@@ -75,9 +91,28 @@ endif()
 if(NOT DEFINED EEFS_DRIVER_SOURCES_${EEFS_DRIVER})
     message(FATAL_ERROR "Unknown EEFS_DRIVER '${EEFS_DRIVER}' (expected standalone, vxworks or rtems)")
 endif()
+if(EEFS_BACKEND STREQUAL "nand" AND NOT EEFS_DRIVER STREQUAL "standalone")
+    message(FATAL_ERROR "EEFS_BACKEND=nand needs EEFS_DRIVER=standalone")
+endif()
+
+# NAND backend library sources (also compiled into the host test library, tests/nand)
+set(EEFS_NAND_LIB_SOURCES
+    libraries/eefs_nand/eefs_crc32.c
+    libraries/eefs_nand/eefs_nand_format.c
+    libraries/eefs_nand/eefs_nand_io.c
+    libraries/eefs_nand/eefs_nand_journal.c
+    libraries/eefs_nand/eefs_nand_rebuild.c
+    libraries/eefs_nand/eefs_nand_fileapi.c
+    libraries/eefs_nand/eefs_nand_health.c)
+
+if(EEFS_BACKEND STREQUAL "nand")
+    set(_eefs_core_sources ${EEFS_NAND_LIB_SOURCES})
+else()
+    set(_eefs_core_sources libraries/eepromfs/eefs_fileapi.c)
+endif()
 
 add_library(eefs STATIC
-    libraries/eepromfs/eefs_fileapi.c
+    ${_eefs_core_sources}
     ${EEFS_DRIVER_SOURCES_${EEFS_DRIVER}})
 add_library(eefs::eefs ALIAS eefs)
 target_link_libraries(eefs PUBLIC eefs_headers)
@@ -92,12 +127,24 @@ set_target_properties(eefs PROPERTIES C_STANDARD 90 C_EXTENSIONS OFF)
 # microeefs: single-function file lookup for bootloaders
 #
 
-add_library(microeefs STATIC libraries/microeefs/microeefs.c)
+if(EEFS_BACKEND STREQUAL "nand")
+    # bootloader library: the lookup plus the pure format module and the CRC
+    set(_microeefs_dir libraries/microeefs_nand)
+    set(_microeefs_sources
+        libraries/microeefs_nand/microeefs_nand.c
+        libraries/eefs_nand/eefs_nand_format.c
+        libraries/eefs_nand/eefs_crc32.c)
+else()
+    set(_microeefs_dir libraries/microeefs)
+    set(_microeefs_sources libraries/microeefs/microeefs.c)
+endif()
+
+add_library(microeefs STATIC ${_microeefs_sources})
 add_library(eefs::microeefs ALIAS microeefs)
 target_link_libraries(microeefs PUBLIC eefs_headers)
 target_include_directories(microeefs
     PUBLIC
-        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/libraries/microeefs>
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/${_microeefs_dir}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/eefs>
     PRIVATE
         ${EEFS_MACROS_DIR})
@@ -117,8 +164,11 @@ endif()
 #
 
 include(CTest)
-if(BUILD_TESTING AND EEFS_BUILD_TOOLS)
+if(BUILD_TESTING AND EEFS_BUILD_TOOLS AND EEFS_BACKEND STREQUAL "eeprom")
     add_subdirectory(tests)
+endif()
+if(BUILD_TESTING AND EEFS_BACKEND STREQUAL "nand" AND NOT CMAKE_CROSSCOMPILING)
+    add_subdirectory(tests/nand)
 endif()
 # RTEMS_BSP is set by cmake/rtems-toolchain.cmake
 if(BUILD_TESTING AND RTEMS_BSP)
@@ -138,8 +188,21 @@ install(FILES
         inc/eefs_fileapi.h
         inc/eefs_version.h
         ${EEFS_MACROS_DIR}/eefs_macros.h
-        libraries/microeefs/microeefs.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
+if(EEFS_BACKEND STREQUAL "nand")
+    install(FILES
+            inc/eefs_nand.h
+            inc/eefs_nand_format.h
+            inc/eefs_nand_hal.h
+            inc/eefs_nand_types.h
+            libraries/microeefs_nand/microeefs_nand.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
+else()
+    install(FILES
+            inc/eefs_eeprom_types.h
+            libraries/microeefs/microeefs.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
+endif()
 if(EEFS_DRIVER STREQUAL "standalone")
     install(FILES drivers/standalone_driver/eefs_filesys.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/eefs)
 elseif(EEFS_DRIVER STREQUAL "vxworks")

@@ -50,6 +50,9 @@
 
 #include "common_types.h"
 #include "eefs_fileapi.h"
+#ifdef EEFS_BACKEND_NAND
+#include "eefs_nand.h"
+#endif
 
 /*
  * Macro Definitions
@@ -59,7 +62,11 @@
 #define EEFS_MAX_MOUNTPOINT_SIZE        16
 #define EEFS_MAX_DEVICES                2
 #define EEFS_MAX_DEVICENAME_SIZE        16
+#ifdef EEFS_BACKEND_NAND
+#define EEFS_MAX_PATH_SIZE              (EEFS_MAX_MOUNTPOINT_SIZE + EEFS_MAX_FILENAME_SIZE + 2)   /* mount point + path + "@A" */
+#else
 #define EEFS_MAX_PATH_SIZE              64
+#endif
 
 /*
  * Type Definitions
@@ -145,6 +152,50 @@ EEFS_DirectoryEntry_t          *EEFS_ReadDir(EEFS_DirectoryDescriptor_t *Directo
 
 /* Close file system for reading the file directory. */
 int32                           EEFS_CloseDir(EEFS_DirectoryDescriptor_t *DirectoryDescriptor);
+
+#ifdef EEFS_BACKEND_NAND
+/*
+ * NAND backend.  Paths are "/MountPoint/stored/path" (the stored path keeps its leading '/'), optionally followed by
+ * "@A" or "@B".  Unlike the wrappers above, these return the EEFS_Lib* code unchanged once the path, volume and device
+ * resolved, and EEFS_ERROR only when they did not.  See eefs_nand.h for the codes.
+ */
+
+/* Formats the NAND device behind BaseAddress (an EEFS_NandDevice_t *) and initializes it, so it can be mounted.  If
+ * DeviceName is already in the DeviceTable it must not be mounted (else EEFS_ERROR) and its entry is re-used;
+ * otherwise a new entry is allocated, and freed again if formatting fails. */
+int32                           EEFS_Format(char *DeviceName, cpuaddr BaseAddress);
+
+/* Writes a whole file into the pending batch */
+int32                           EEFS_WriteFile(char *Path, const EEFS_NandFileInfo_t *Meta, const void *Data, uint32 Size);
+
+/* Commits or discards the pending batch of a volume */
+int32                           EEFS_Commit(char *MountPoint);
+int32                           EEFS_Abort(char *MountPoint);
+
+/* Checks every CRC of a file / returns its directory entry and type info */
+int32                           EEFS_VerifyFile(char *Path);
+int32                           EEFS_GetFileInfo(char *Path, EEFS_NandFileInfo_t *Info);
+
+/* A/B */
+int32                           EEFS_SetActiveSlot(char *Path, uint8 Slot);
+int32                           EEFS_SetActiveSlotAll(char *MountPoint, uint8 Slot);
+int32                           EEFS_SetFallbackCompatible(char *Path, uint8 Flag);
+int32                           EEFS_SetFallbackCompatibleAll(char *MountPoint, uint8 Flag);
+int32                           EEFS_SetFailed(char *Path);
+int32                           EEFS_ClearFailed(char *Path);
+int32                           EEFS_CopySlot(char *Path, uint8 From, uint8 To);
+int32                           EEFS_CopySlotAll(char *MountPoint, uint8 From, uint8 To);
+
+/* Directory maintenance */
+int32                           EEFS_RepairDirectory(char *MountPoint);
+int32                           EEFS_RebuildDirectory(char *MountPoint);
+int32                           EEFS_ReclaimOrphans(char *MountPoint);
+
+/* Health check */
+int32                           EEFS_HealthCheckStart(char *MountPoint, EEFS_HealthReport_t *Report);
+int32                           EEFS_HealthCheckStep(char *MountPoint, uint32 MaxPageReads);
+int32                           EEFS_HealthCheckSummary(char *MountPoint, EEFS_HealthSummary_t *Out);
+#endif
 
 #endif 
 

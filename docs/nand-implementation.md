@@ -40,7 +40,8 @@ New:
 | `tests/rtems/eefs_rtems_nand_test.c` | RTEMS QEMU test for the NAND backend |
 
 Modified: `inc/eefs_fileapi.h`, `inc/eefs_config.h`, `drivers/standalone_driver/eefs_filesys.[ch]`,
-`CMakeLists.txt`, `tools/CMakeLists.txt`, `tests/rtems/CMakeLists.txt`, `CLAUDE.md`, `README.md`.
+`CMakeLists.txt`, `tests/rtems/CMakeLists.txt`, `CLAUDE.md`, `README.md`. (`tools/CMakeLists.txt` needs no
+change: the top-level `CMakeLists.txt` does not add `tools/` for the NAND backend.)
 
 Untouched: `libraries/eepromfs/`, `libraries/microeefs/`, `tools/`, `tests/golden/`, `tests/data/`,
 `tests/run_test.cmake`, `tests/CMakeLists.txt`, `tools/geneepromfs/eefs_config.h`.
@@ -92,9 +93,10 @@ way but linked against the real `eefs` target (default maxima) that is only regi
 target geometry. Tests are registered as:
 
 ```cmake
-set(EEFS_NAND_GEOMETRIES "4096;224;128" "2048;64;64" "8192;448;64")   # PageSize;OobSize;PagesPerBlock
+set(EEFS_NAND_GEOMETRIES 4096:224:128 2048:64:64 8192:448:64)   # PageSize:OobSize:PagesPerBlock
 set(EEFS_NAND_TEST_BLOCKS 4096)
-foreach(geom IN LISTS EEFS_NAND_GEOMETRIES)
+foreach(geom_text IN LISTS EEFS_NAND_GEOMETRIES)
+    string(REPLACE ":" ";" geom ${geom_text})
     list(GET geom 0 page) ... 
     foreach(suite IN LISTS EEFS_NAND_SUITES)   # layout sim journal fileops powercut rebuild ab health micro
         add_test(NAME nand_${suite}_${page}_${oob}_${ppb}
@@ -209,10 +211,12 @@ only). `tools/geneepromfs/eefs_config.h` is **not** touched.
 #ifndef EEFS_NAND_HEALTH_PATH_SIZE
 #define EEFS_NAND_HEALTH_PATH_SIZE       64      /* truncated path copy in a finding */
 #endif
-#if EEFS_MAX_FILES > 126
+#if defined(EEFS_BACKEND_NAND) && (EEFS_MAX_FILES > 126)
 #error "EEFS_MAX_FILES must be <= 126 for the NAND block map encoding"
 #endif
 ```
+
+(The `EEFS_MAX_FILES` check applies to the NAND backend only, so the EEPROM build keeps its old limits.)
 
 ### 2.3 `inc/eefs_nand_hal.h`
 
@@ -415,9 +419,9 @@ boolean EEFS_NandIsErased(const uint8 *Data, uint32 Length);                /* a
 /* Page 0 */
 uint32  EEFS_NandMaxBlocksPerFile(uint32 PageSize);                         /* (PageSize-1532)/6 */
 int32   EEFS_NandEncodePage0(uint8 *Page, uint32 PageSize, const EEFS_NandPage0_t *P,
-                             const uint16 *Blocks, const uint32 *BlockCrcs);  /* fills whole page incl. 0xFF tail and HeaderCrc; EEFS_INVALID_ARGUMENT if BlockCount too big or SigType != 0 */
-int32   EEFS_NandDecodePage0(const uint8 *Page, uint32 PageSize, uint32 ExpectBlock, EEFS_NandPage0_t *P);
-        /* FMT 3.4 checks 2-7 (ExpectBlock is Blocks[0].Block check; DirRegionBlocks/BlockCount bounds are checked by the caller via EEFS_NandPage0Block). Returns EEFS_SUCCESS or EEFS_CORRUPT_FILE. */
+                             const uint16 *Blocks, const uint32 *BlockCrcs);  /* fills whole page incl. 0xFF tail and HeaderCrc; EEFS_INVALID_ARGUMENT if BlockCount is 0 or too big, SigType or SigLength != 0, FileType > 5, or Path does not start with '/' or is not terminated */
+int32   EEFS_NandDecodePage0(const uint8 *Page, uint32 PageSize, uint32 PagesPerBlock, uint32 ExpectBlock, EEFS_NandPage0_t *P);
+        /* FMT 3.4 checks 2-7 (ExpectBlock is Blocks[0].Block check; PagesPerBlock is needed for BlockCount * BlockBytes >= PageSize + FileSize; DirRegionBlocks/BlockCount bounds are checked by the caller via EEFS_NandPage0Block). Returns EEFS_SUCCESS or EEFS_CORRUPT_FILE. */
 void    EEFS_NandPage0Block(const uint8 *Page, uint32 Index, uint16 *Block, uint32 *Crc);
 uint32  EEFS_NandBlockDataRange(uint32 PageSize, uint32 PagesPerBlock, uint32 FileSize, uint32 K,
                                 uint32 *Offset);                             /* returns byte count held by Blocks[K], sets its file offset */
@@ -425,7 +429,10 @@ uint32  EEFS_NandBlockDataRange(uint32 PageSize, uint32 PagesPerBlock, uint32 Fi
 /* Record pages */
 void    EEFS_NandBeginRecordPage(uint8 *Page, uint32 PageSize, const EEFS_NandRecHdr_t *H);   /* writes header fields, fills [32,PageSize) with 0xFF */
 void    EEFS_NandSealRecordPage(uint8 *Page, uint32 PageSize, uint32 PayloadLen);             /* sets PayloadLen and Crc32 */
-int32   EEFS_NandDecodeRecordPage(const uint8 *Page, uint32 PageSize, EEFS_NandRecHdr_t *H);  /* FMT 4.2 page validity; EEFS_SUCCESS / EEFS_CORRUPT_FILE */
+int32   EEFS_NandDecodeRecordPage(const uint8 *Page, uint32 PageSize, EEFS_NandRecHdr_t *H);
+        /* FMT 4.2 page validity plus the item framing of FMT 4.3 (every item fits PayloadLen; VOLUME Len 40, ENTRY Len 332,
+           MAPCHUNK Len 8 + Count with Count >= 1, CLEANUP Len 4 + 2 * Count with Count >= 1), so a record whose pages all
+           decode can be applied without failing half way; EEFS_SUCCESS / EEFS_CORRUPT_FILE. H is filled on success only. */
 
 /* Items: encoders return bytes written, or 0 if the item does not fit in Avail */
 uint32  EEFS_NandEncodeVolumeItem(uint8 *Dst, uint32 Avail, const EEFS_NandVolumeItem_t *V);
@@ -437,6 +444,7 @@ int32   EEFS_NandNextItem(const uint8 *Payload, uint32 PayloadLen, uint32 *Curso
 int32   EEFS_NandDecodeVolumeItem(const uint8 *Body, uint16 Len, EEFS_NandVolumeItem_t *V);
 int32   EEFS_NandDecodeEntryItem(const uint8 *Body, uint16 Len, uint16 *Index, EEFS_NandEntry_t *E);
 /* MAPCHUNK and CLEANUP are decoded inline with Get16/Get32 by the callers */
+uint32  EEFS_NandMapChunkFit(uint32 Avail);   /* largest MAPCHUNK Count that fits in Avail bytes (0 if none), for the greedy packer */
 ```
 
 `EEFS_NandEncodeMapChunk` serializes `0xFC` as `0xFF`. All encoders write every byte of the item
@@ -642,6 +650,10 @@ int32 EEFS_HealthCheckSummary(char *MountPoint, EEFS_HealthSummary_t *Out);
 #endif
 ```
 
+`EEFS_Format` on a device that is in the table but not mounted, and whose volume is initialized, first releases it
+with `EEFS_LibFreeFS` (returning that code if it fails, e.g. `EEFS_TRANSACTION_ERROR`), since `EEFS_LibFormat` needs an
+unmounted scratch volume. The `BaseAddress` must not belong to another device (`EEFS_ERROR`).
+
 Unlike the existing wrappers (which collapse every failure to `EEFS_ERROR`), the new wrappers
 **return the `EEFS_Lib*` code unchanged** when the path resolved, and `EEFS_ERROR` only for path /
 volume / device lookup failures. `EEFS_UnMount` under NAND calls `EEFS_LibCommit` first and fails
@@ -686,7 +698,7 @@ int32   EEFS_NandEraseBlock(Vol, uint32 Block);          /* SUCCESS or EEFS_IO_E
 void    EEFS_NandMarkBad(Vol, uint32 Block);             /* Working.Map[Block] = BAD; best-effort OOB marker on the lowest BadMarkerPages page; removes Block from any mirror ring (sets Disabled when empty); VolumeChangeCounter++ */
 boolean EEFS_NandHasBadMarker(Vol, uint32 Block);        /* reads the OOB of every BadMarkerPages page (Data NULL); TRUE if any byte at BadMarkerOffset != 0xFF or a read fails */
 int32   EEFS_NandReadPage0(Vol, uint32 Block, EEFS_NandPage0_t *P, const uint8 **Raw);
-        /* cached read + EEFS_NandDecodePage0(ExpectBlock = Block) + bounds check of every Blocks[i] (>= DirRegionBlocks, < BlockCount). SUCCESS / EEFS_CORRUPT_FILE / EEFS_IO_ERROR. *Raw = cache pointer for Blocks[] access. */
+        /* cached read + EEFS_NandDecodePage0(PagesPerBlock from the geometry, ExpectBlock = Block) + bounds check of every Blocks[i] (>= DirRegionBlocks, < BlockCount). SUCCESS / EEFS_CORRUPT_FILE / EEFS_IO_ERROR. *Raw = cache pointer for Blocks[] access. */
 ```
 
 `EEFS_NandProgramPage` uses `Vol->PageBuf` as the read-back scratch; callers that are building the
@@ -1425,7 +1437,7 @@ typedef struct NandSim NandSim_t;      /* opaque; one static instance per test, 
 #define NANDSIM_TORN_PARTIAL   1   /* program: the first half of the page is applied, the rest stays 0xFF; erase: half the pages erased */
 #define NANDSIM_TORN_GARBAGE   2   /* program: every byte of the page is XORed with a pattern (unreadable CRC) */
 
-NandSim_t *NandSim_Create(const EEFS_NandGeometry_t *Geo);          /* lazily allocates blocks on first erase/program; erased blocks read 0xFF without storage */
+NandSim_t *NandSim_Create(const EEFS_NandGeometry_t *Geo);          /* lazily allocates a block on its first program; a successful erase releases it; erased blocks read 0xFF without storage */
 void       NandSim_Destroy(NandSim_t *Sim);
 void       NandSim_FillDevice(NandSim_t *Sim, EEFS_NandDevice_t *Dev); /* Geometry copy, Ops, Ctx = Sim */
 
@@ -1462,6 +1474,12 @@ uint32 NandSim_Violations(const NandSim_t *Sim);
 `ReadPage` honours `Data == NULL` / `Oob == NULL`. A read of a factory-bad block with `Data !=
 NULL` returns `EEFS_NAND_READ_UNCORRECTABLE` (its data is garbage), with `Data == NULL` returns 0
 (raw OOB) so the marker scan works. Erased pages return 0 and all `0xFF`.
+
+Additions made in phase 1 (see `tests/nand/nand_sim.h` for the full contract): `NandSim_Ops()`,
+`NandSim_RawRead`, `NandSim_PageIsProgrammed`, the `NANDSIM_ANY` wildcard (block or page) for injections; counters count
+calls including failed ones; `ResetCounters` also clears `Violations`; an OOB-only program (the bad-block marker) is
+exempt from the strict page rules; `TORN_GARBAGE` applied to an erase XORs every byte of the block with `0xA5` (the
+block is left neither erased nor intact); `RawErase` also clears a factory-bad mark.
 
 Power-cut sweeps are written as: for `cut = 1 ..` `{ fresh sim from a saved image (NandSim_Clone
 copies the content); SetPowerBudget(cut, mode); run the operation; if !PowerCutHappened break;
@@ -1517,7 +1535,7 @@ arguments and returns `EEFS_UNSUPPORTED_OPTION` (or NULL / 0 for pointer and cou
 `EEFS_LibInit` is real. `libraries/microeefs_nand/microeefs_nand.[ch]` as stubs returning
 `EEFS_UNSUPPORTED_OPTION`. `tests/nand/nand_sim.[ch]` complete (section 11), `nand_test.h`,
 `nand_test_main.c`, `test_layout.c`, `test_sim.c`, `tests/nand/CMakeLists.txt`.
-Modifies: `inc/eefs_fileapi.h`, `inc/eefs_config.h`, `CMakeLists.txt`, `tools/CMakeLists.txt`,
+Modifies: `inc/eefs_fileapi.h`, `inc/eefs_config.h`, `CMakeLists.txt`,
 `drivers/standalone_driver/eefs_filesys.[ch]` (only the `EEFS_MAX_PATH_SIZE`/`SplitPath` change and
 the new wrapper prototypes with bodies that call the Lib stubs), `tests/rtems/CMakeLists.txt`
 (select source by backend; the NAND test source is a placeholder that prints PASSED).
@@ -1538,6 +1556,17 @@ x 4096: after writing 3 blocks `AllocatedBytes < 4 MiB`), `sim_factory_bad`, `si
 Done when: `eeprom` host build passes the 4 golden tests with no change in any generated file;
 `eeprom` RTEMS QEMU test passes; `nand` host build passes `nand_layout_*` and `nand_sim_*` for all
 three geometries; `nand` RTEMS build compiles and links.
+
+As delivered: the descriptor-table helpers that only inspect the shared globals (`EEFS_LibHasOpenFiles`,
+`HasOpenDir`, `FileDescriptor2Pointer`, `GetFileDescriptorsInUse`, `GetFileDescriptorsHighWaterMark`, `GetMaxFiles`,
+`GetMaxOpenFiles`, `PrintOpenFiles`) already behave as in the EEPROM backend, and `EEFS_LibCreat`/`EEFS_LibWrite`
+already have their final behaviour (`EEFS_UNSUPPORTED_OPTION`). The driver wrappers of 2.7 are complete (path and
+mount-point resolution, `EEFS_Format` device handling); later phases only implement the `EEFS_Lib*` bodies they call,
+plus the `EEFS_UnMount` commit (phase 3). `MicroEEFS_NandSetSlotHook` already stores the hook. The `layout` suite
+also has `block_data_range` (FMT 3.3 ranges) and `capacity_table` (the FMT 4.6 page counts, packed with the encoders
+the way 5.4 describes). `eefs_nand_test_default` is built from phase 1 on and registered in phase 3. The phase 1
+`eefs_rtems_nand_test.c` checks the CRC, the simulator and a page 0 round trip on the target and expects
+`EEFS_Format` to return `EEFS_UNSUPPORTED_OPTION`; phase 2 must update that expectation.
 
 ### Phase 2: journaled directory
 

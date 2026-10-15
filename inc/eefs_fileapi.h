@@ -166,7 +166,11 @@
  */
 
 #define EEFS_FILESYS_MAGIC              0xEEF51234
+#ifdef EEFS_BACKEND_NAND
+#define EEFS_MAX_FILENAME_SIZE          EEFS_NAND_MAX_PATH_SIZE
+#else
 #define EEFS_MAX_FILENAME_SIZE          40
+#endif
 
 /*
  * File Attributes
@@ -202,71 +206,23 @@
 #define EEFS_NO_SUCH_DEVICE           (-8)
 #define EEFS_DEVICE_IS_BUSY           (-9)
 #define EEFS_READ_ONLY_FILE_SYSTEM   (-10)
+#define EEFS_IO_ERROR                (-11)   /* uncorrectable ECC, read/program/erase failure (NAND) */
+#define EEFS_CORRUPT_FILE            (-12)   /* metadata page or CRC check failed (NAND) */
+#define EEFS_NOT_FORMATTED           (-13)   /* no directory and no metadata page on the device (NAND) */
+#define EEFS_TRANSACTION_ERROR       (-14)   /* pending batch too large (cleanup list full), or uncommitted changes (NAND) */
+#define EEFS_GEOMETRY_MISMATCH       (-15)   /* device was formatted with another geometry/configuration (NAND) */
 
 /*
  * Type Definitions
  */
 
-typedef struct
-{
-    uint32                              Crc;
-    uint32                              Magic;
-    uint32                              Version;
-    uint32                              FreeMemoryOffset;
-    uint32                              FreeMemorySize;
-    uint32                              NumberOfFiles;
-} EEFS_FileAllocationTableHeader_t;
-
-typedef struct
-{
-    uint32                              FileHeaderOffset;   /* relative offset of the file header from the beginning of the file system */
-    uint32                              MaxFileSize;        /* max size of the slot in bytes (note this number does NOT include the file header) */
-} EEFS_FileAllocationTableEntry_t;
-
-typedef struct
-{
-    EEFS_FileAllocationTableHeader_t    Header;
-    EEFS_FileAllocationTableEntry_t     File[EEFS_MAX_FILES];
-} EEFS_FileAllocationTable_t;
-
-typedef struct
-{
-    uint32                              Crc;
-    uint32                              InUse;  /* if InUse is FALSE then the file has been deleted */
-    uint32                              Attributes;
-    uint32                              FileSize;
-    uint32                              ModificationDate;   /* time_t seconds, stored as 32 bits so the layout is host independent */
-    uint32                              CreationDate;
-    char                                Filename[EEFS_MAX_FILENAME_SIZE];
-} EEFS_FileHeader_t;
-
-typedef struct
-{
-    void                               *FileHeaderPointer;
-    uint32                              MaxFileSize;
-} EEFS_InodeTableEntry_t;
-
-typedef struct
-{
-    cpuaddr                             BaseAddress;
-    void                               *FreeMemoryPointer;
-    uint32                              FreeMemorySize;
-    uint32                              NumberOfFiles;
-    EEFS_InodeTableEntry_t              File[EEFS_MAX_FILES];
-} EEFS_InodeTable_t;
-
-typedef struct
-{
-    uint32                              InUse;
-    uint32                              Mode;
-    void                               *FileHeaderPointer;
-    void                               *FileDataPointer;
-    uint32                              ByteOffset;
-    uint32                              FileSize;
-    uint32                              MaxFileSize;
-    EEFS_InodeTable_t                  *InodeTable;
-    uint32                              InodeIndex;
-} EEFS_FileDescriptor_t;
+/* Backend-specific on-media and RAM types: EEFS_InodeTable_t and EEFS_FileDescriptor_t (plus the EEPROM
+ * File Allocation Table and File Header, or the NAND volume state) */
+#ifdef EEFS_BACKEND_NAND
+#include "eefs_nand_types.h"
+#else
+#include "eefs_eeprom_types.h"
+#endif
 
 typedef struct
 {

@@ -256,7 +256,9 @@ Item header (4 bytes):
 
 Readers must skip items with an unknown `Type` using `Len` (none are defined in version 1, but
 this keeps the iterator robust) and must stop at `PayloadLen`. An item whose `4 + Len` exceeds the
-remaining payload makes the page, and therefore the record, invalid.
+remaining payload makes the page, and therefore the record, invalid. So does an item of a type defined below whose
+`Len` disagrees with its definition (VOLUME `Len` other than 40, ENTRY other than 332, MAPCHUNK other
+than `8 + Count` or with `Count` 0, CLEANUP other than `4 + 2 * Count` or with `Count` 0).
 
 #### 4.3.1 VOLUME (Type 1, Len 40)
 
