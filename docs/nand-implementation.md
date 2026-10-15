@@ -1456,8 +1456,9 @@ CRCs (full rule). Return codes: `EEFS_SUCCESS`, `EEFS_INVALID_ARGUMENT`, `EEFS_F
 `EEFS_GEOMETRY_MISMATCH` (VOLUME item disagrees), `EEFS_CORRUPT_FILE`, `EEFS_IO_ERROR`,
 `EEFS_NO_SPACE_LEFT_ON_DEVICE` (`FileSize > MaxSize`), `EEFS_NOT_FORMATTED` (no directory and the
 scan found no metadata page at all). Page reads: `DirRegionBlocks + 2 x 2 x PagesPerBlock`
-(two passes over at most two chains) + 1 per block loaded + 1 page 0 re-read per block transition;
-scan fallback adds `BlockCount - DirRegionBlocks`.
+(two passes over at most two chains) + 1 for page 0 + 1 per data page loaded (full pages are read
+straight into the destination and only the file's last, partial page goes through `PageBuffer`, so page 0
+is never re-read); scan fallback adds `BlockCount - DirRegionBlocks`.
 
 Candidate tracking: one `EEFS_NandEntry_t` (328 bytes) plus its index; `MAPCHUNK` and `CLEANUP`
 items are skipped by length. A checkpoint resets the candidate before its items are applied.
@@ -1703,7 +1704,7 @@ added to the API for that purpose, and run for `TornMode` NONE, PARTIAL and GARB
 | Minimum `PagesPerBlock` (2 x (ckpt + 1)) | 28 | 16 | 10 |
 | Volume RAM (defaults, `EEFS_MAX_FILES` 64) | ~61.7 KB (buffers sized by `EEFS_NAND_MAX_PAGE_SIZE`, not the geometry) | | |
 | Two devices | ~124 KB | | |
-| Bootloader RAM | caller page buffer + ~1.2 KB stack | | |
+| Bootloader RAM | caller page buffer + ~1.5 KB stack (measured, `arm-rtems7-gcc -O2`) | | |
 | Mount reads | <= 16 + 4 x 64 + 128 = 400 | <= 16 + 4 x 128 + 128 = 656 | <= 16 + 4 x 64 + 128 = 400 |
 
 ## 13. Locking and concurrency

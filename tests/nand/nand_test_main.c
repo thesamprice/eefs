@@ -43,10 +43,13 @@ typedef struct
 
 EEFS_NandGeometry_t         NandTest_Geo;
 
+extern const NandTest_Case_t NandTest_MicroCases[];     /* test_micro.c */
+
 static const NandTest_Suite_t NandTest_Suites[] = {
     { "layout", NandTest_LayoutCases },
     { "sim",    NandTest_SimCases },
     { "journal", NandTest_JournalCases },
+    { "micro",  NandTest_MicroCases },
     { NULL,     NULL }
 };
 

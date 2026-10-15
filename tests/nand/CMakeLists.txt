@@ -11,10 +11,13 @@ set(EEFS_NAND_TEST_SOURCES
     nand_test_main.c
     test_layout.c
     test_sim.c
-    test_journal.c)
+    test_journal.c
+    test_micro.c
+    nand_fixture.c
+    ${PROJECT_SOURCE_DIR}/libraries/microeefs_nand/microeefs_nand.c)
 
-# Suites registered so far (later phases append fileops powercut rebuild ab health micro)
-set(EEFS_NAND_SUITES layout sim journal)
+# Suites registered so far (later phases append fileops powercut rebuild ab health)
+set(EEFS_NAND_SUITES layout sim journal micro)
 
 # PageSize:OobSize:PagesPerBlock
 set(EEFS_NAND_GEOMETRIES 4096:224:128 2048:64:64 8192:448:64)
@@ -32,6 +35,7 @@ target_include_directories(eefs_nand_testlib PUBLIC
     ${EEFS_MACROS_DIR}
     ${PROJECT_SOURCE_DIR}/drivers/standalone_driver
     ${PROJECT_SOURCE_DIR}/libraries/eefs_nand
+    ${PROJECT_SOURCE_DIR}/libraries/microeefs_nand
     ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(eefs_nand_testlib PRIVATE ${EEFS_WARNING_FLAGS})
 set_target_properties(eefs_nand_testlib PROPERTIES C_STANDARD 90 C_EXTENSIONS OFF)
@@ -49,6 +53,7 @@ add_executable(eefs_nand_test_default
 target_link_libraries(eefs_nand_test_default PRIVATE eefs)
 target_include_directories(eefs_nand_test_default PRIVATE
     ${PROJECT_SOURCE_DIR}/libraries/eefs_nand
+    ${PROJECT_SOURCE_DIR}/libraries/microeefs_nand
     ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(eefs_nand_test_default PRIVATE ${EEFS_WARNING_FLAGS})
 set_target_properties(eefs_nand_test_default PROPERTIES C_STANDARD 90 C_EXTENSIONS OFF)
